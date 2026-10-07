@@ -54,6 +54,10 @@ message InputProcessorInfo {
     uint32 inertia_fast_output_percent = 27;
     bool inertia_enabled = 28;
     uint32 inertia_normal_max_output = 29; // 0 means unlimited; fast stage ignores it
+    // Tilt compensation settings
+    uint32 tilt_degrees = 30;       // 0..60, 0 = off. Boost 1/cos(tilt) along the tilt axis
+    int32 tilt_axis_degrees = 31;   // (-90, 90], clockwise from the up/down axis (0 = up/down, 90 = left/right)
+    bool tilt_supported = 32;       // always true in this fork, so clients can detect support
 }
 
 message ListInputProcessorsRequest {
@@ -316,6 +320,21 @@ message SetInertiaNotificationsRequest {
 }
 message SetInertiaNotificationsResponse {}
 
+// Tilt compensation: out-of-range values are clamped/normalized, not rejected.
+message SetTiltRequest {
+    uint32 id = 1;
+    uint32 value = 2;         // Tilt in degrees, clamped to 0..60 (0 = off)
+    WriteMode write_mode = 3; // Where to store the value (default: persist)
+}
+message SetTiltResponse {}
+
+message SetTiltAxisRequest {
+    uint32 id = 1;
+    int32 value = 2;          // Axis in degrees clockwise from up/down, normalized into (-90, 90]
+    WriteMode write_mode = 3; // Where to store the value (default: persist)
+}
+message SetTiltAxisResponse {}
+
 // Persist every processor's current in-memory settings to flash. Flushes values
 // that were set with WRITE_MODE_MEMORY.
 message SaveAllSettingsRequest {
@@ -380,6 +399,8 @@ message Request {
         SetInertiaFastOutputPercentRequest set_inertia_fast_output_percent = 31;
         SetInertiaEnabledRequest set_inertia_enabled = 32;
         SetInertiaNormalMaxOutputRequest set_inertia_normal_max_output = 33;
+        SetTiltRequest set_tilt = 34;
+        SetTiltAxisRequest set_tilt_axis = 35;
     }
 }
 
@@ -420,6 +441,8 @@ message Response {
         SetInertiaFastOutputPercentResponse set_inertia_fast_output_percent = 32;
         SetInertiaEnabledResponse set_inertia_enabled = 33;
         SetInertiaNormalMaxOutputResponse set_inertia_normal_max_output = 34;
+        SetTiltResponse set_tilt = 35;
+        SetTiltAxisResponse set_tilt_axis = 36;
     }
 }
 

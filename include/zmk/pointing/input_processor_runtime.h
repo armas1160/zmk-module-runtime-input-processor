@@ -38,6 +38,9 @@ struct zmk_input_processor_runtime_config {
     uint32_t scale_multiplier;
     uint32_t scale_divisor;
     int32_t rotation_degrees;
+    // Tilt compensation settings
+    uint8_t tilt_degrees;      // 0..60, 0 = off; boost 1/cos(tilt) along the tilt axis
+    int16_t tilt_axis_degrees; // (-90, 90], clockwise from up/down (90 = left/right)
     // Temp-layer layer settings
     bool temp_layer_enabled;
     uint8_t temp_layer_layer;
@@ -91,6 +94,34 @@ int zmk_input_processor_runtime_set_scaling(const struct device *dev, uint32_t m
  */
 int zmk_input_processor_runtime_set_rotation(const struct device *dev, int32_t degrees,
                                              enum zmk_input_processor_runtime_write_mode mode);
+
+/**
+ * @brief Set the tilt compensation angle for a runtime input processor
+ *
+ * Motion along the tilt axis (see zmk_input_processor_runtime_set_tilt_axis)
+ * is multiplied by 1 / cos(degrees), after rotation. 0 disables it.
+ *
+ * @param dev Pointer to the device structure
+ * @param degrees Tilt in degrees; clamped to 0..60 (60 doubles the axis)
+ * @param mode Where to store the value (persist to flash, memory-only, or temporary)
+ * @return 0 on success, negative error code on failure
+ */
+int zmk_input_processor_runtime_set_tilt(const struct device *dev, uint32_t degrees,
+                                         enum zmk_input_processor_runtime_write_mode mode);
+
+/**
+ * @brief Set the axis that tilt compensation boosts
+ *
+ * Like a clock hand, clockwise from the 12-6 o'clock (up/down) axis:
+ * 0 = up/down, 30 = 1-7 o'clock, 90 = left/right, -30 = 11-5 o'clock.
+ *
+ * @param dev Pointer to the device structure
+ * @param degrees Axis angle in degrees; normalized into (-90, 90] (180-degree periodic)
+ * @param mode Where to store the value (persist to flash, memory-only, or temporary)
+ * @return 0 on success, negative error code on failure
+ */
+int zmk_input_processor_runtime_set_tilt_axis(const struct device *dev, int32_t degrees,
+                                              enum zmk_input_processor_runtime_write_mode mode);
 
 /**
  * @brief Reset processor to default values and save to persistent storage
@@ -446,6 +477,9 @@ int zmk_input_processor_runtime_test_apply_legacy_v1(const struct device *dev);
 
 /** @brief Test-only: apply a v2 blob without the normal-stage output limit. */
 int zmk_input_processor_runtime_test_apply_legacy_v2(const struct device *dev);
+
+/** @brief Test-only: apply a v3 blob (rotation 44) without the tilt fields. */
+int zmk_input_processor_runtime_test_apply_legacy_v3(const struct device *dev);
 
 /** @brief Test-only: verify timed report splitting and rolling expiration. */
 int zmk_input_processor_runtime_test_inertia_sliding_window(void);

@@ -8,6 +8,7 @@ This ZMK module provides runtime configurable input processors for pointing devi
 - **Web Interface**: Configure settings through a browser-based UI
 - **Scaling Support**: Configure speed multipliers (e.g., x2 faster, x0.5 slower)
 - **Rotation Support**: Apply rotation transformations in degrees (fully implemented with paired X/Y handling)
+- **Tilt Compensation**: Boost one (rotatable) axis by 1/cos(tilt) for trackballs rolled from a diagonal
 - **Axis Reversing**: Invert X and/or Y axis independently to reverse input direction
 - **Inertia**: Continue input after a rapid, configurable directional movement
 - **Axis Snapping**: Lock scrolling to X or Y axis with threshold-based unlock
@@ -480,6 +481,53 @@ When you press and hold the snap behavior key:
 1. Current snap settings are saved
 2. Temporary snap settings are applied (with 1000ms timeout)
 3. When you release the key, original settings are restored
+
+### Tilt Compensation
+
+For a trackball read by an optical sensor directly under the ball (for
+example a PMW3610). Rolling the ball "up" from a diagonal instead of from
+straight above tilts the ball's rotation axis, so the sensor only sees
+`cos(tilt)` of that motion. With the thumb at the very side (90 degrees) the
+rotation axis lines up with the sensor's view and nothing is seen at all.
+Tilt compensation multiplies motion along one axis by `1 / cos(tilt)`.
+
+- `tilt-degrees` (default `0` = off): capped at **60 degrees**, which doubles
+  the axis. Larger requests are clamped to 60 rather than rejected; the
+  setting never approaches 90, where the gain would diverge.
+
+  | tilt | 0     | 15    | 30    | 45    | 60    |
+  | ---- | ----- | ----- | ----- | ----- | ----- |
+  | gain | 1.000 | 1.035 | 1.155 | 1.414 | 2.000 |
+
+- `tilt-axis-degrees` (default `0`): which axis is boosted, turned like a
+  clock hand clockwise from 12 o'clock: `0` = 12-6 o'clock (up/down), `30` =
+  1-7 o'clock, `90` = 3-9 o'clock (left/right), `-30` = 11-5 o'clock. The axis
+  has no direction, so values are normalized into `(-90, 90]` (for example
+  `-90` becomes `90` and `120` becomes `-60`).
+
+```dts
+&my_rip {
+    tilt-degrees = <45>;      // x1.414 ...
+    tilt-axis-degrees = <0>;  // ... along up/down
+};
+```
+
+The boost is applied after rotation, in the event codes' frame (x right,
+y down). With `d = (sin a, -cos a)` for axis `a` and `k = 1 / cos(tilt)`, the
+processor applies `M = (I + (k - 1) d d^T) * R(rotation)`, precomputed in
+fixed point x1000 (rounded) with a per-axis sub-count remainder carried
+between events, so slow 1-count movement is not lost (this also applies to
+plain rotation). When rotation and tilt are both zero, events pass through
+untouched.
+
+Both values follow the same write modes as the other settings (persist /
+memory / temporary) and are saved with them. Over Studio RPC they are
+`SetTiltRequest` / `SetTiltAxisRequest` and the `tilt_degrees`,
+`tilt_axis_degrees` and `tilt_supported` fields of `InputProcessorInfo`; the
+firmware API is `zmk_input_processor_runtime_set_tilt()` /
+`zmk_input_processor_runtime_set_tilt_axis()`. The bundled web UI does not
+show tilt controls yet. The temporary-config behavior leaves tilt unchanged
+while held and restores the saved value on release.
 
 ## Development Guide
 

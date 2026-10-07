@@ -935,6 +935,201 @@ static int test_write_modes_and_save_discard(void) {
     return 0;
 }
 
+static int process_test_relative(const struct device *dev, uint16_t code, int32_t input,
+                                 int32_t *output) {
+    struct input_event event = {.type = INPUT_EV_REL, .code = code, .value = input};
+    int ret = zmk_input_processor_handle_event(dev, &event, 0, 0, NULL);
+    *output = event.value;
+    return ret == ZMK_INPUT_PROC_CONTINUE ? 0 : -EINVAL;
+}
+
+/* Feed X then Y then X. The transform pairs each axis with the other's
+ * latest value, so the first X after a transform change reports 0. */
+static int process_test_xyx(const struct device *dev, int32_t x, int32_t y, int32_t out[3]) {
+    int ret;
+    if ((ret = process_test_relative(dev, INPUT_REL_X, x, &out[0])) < 0 ||
+        (ret = process_test_relative(dev, INPUT_REL_Y, y, &out[1])) < 0 ||
+        (ret = process_test_relative(dev, INPUT_REL_X, x, &out[2])) < 0) {
+        return ret;
+    }
+    return 0;
+}
+
+/* Tilt compensation: clamping/normalization, the transform applied to
+ * events (including the remainder carry), v4 persistence and the v3 upgrade. */
+static int test_tilt(void) {
+    const struct device *dev = zmk_input_processor_runtime_find_by_name(TEST_PROCESSOR_NAME);
+    if (!dev) {
+        LOG_ERR("Test processor '%s' not found", TEST_PROCESSOR_NAME);
+        return -ENODEV;
+    }
+
+    struct zmk_input_processor_runtime_config cfg;
+    int ret;
+
+    /* Out-of-range requests are clamped / normalized, not rejected. */
+    static const struct {
+        uint32_t in;
+        uint8_t out;
+    } tilt_cases[] = {{70, 60}, {45, 45}, {0, 0}};
+    for (size_t i = 0; i < ARRAY_SIZE(tilt_cases); i++) {
+        ret = zmk_input_processor_runtime_set_tilt(dev, tilt_cases[i].in,
+                                                   ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_MEMORY);
+        if (ret < 0) {
+            return ret;
+        }
+        zmk_input_processor_runtime_get_config(dev, NULL, &cfg);
+        if (cfg.tilt_degrees != tilt_cases[i].out) {
+            LOG_ERR("Tilt %u: got %u expected %u", tilt_cases[i].in, cfg.tilt_degrees,
+                    tilt_cases[i].out);
+            return -EINVAL;
+        }
+    }
+    static const struct {
+        int32_t in;
+        int16_t out;
+    } axis_cases[] = {{-90, 90}, {120, -60}, {270, 90}, {-30, -30}};
+    for (size_t i = 0; i < ARRAY_SIZE(axis_cases); i++) {
+        ret = zmk_input_processor_runtime_set_tilt_axis(
+            dev, axis_cases[i].in, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_MEMORY);
+        if (ret < 0) {
+            return ret;
+        }
+        zmk_input_processor_runtime_get_config(dev, NULL, &cfg);
+        if (cfg.tilt_axis_degrees != axis_cases[i].out) {
+            LOG_ERR("Tilt axis %d: got %d expected %d", axis_cases[i].in, cfg.tilt_axis_degrees,
+                    axis_cases[i].out);
+            return -EINVAL;
+        }
+    }
+
+    /* Isolate the transform from rotation, scaling and inertia. */
+    if ((ret = zmk_input_processor_runtime_set_rotation(
+             dev, 0, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY)) < 0 ||
+        (ret = zmk_input_processor_runtime_set_scaling(
+             dev, 1, 1, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY)) < 0 ||
+        (ret = zmk_input_processor_runtime_set_inertia_enabled(
+             dev, false, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY)) < 0) {
+        return ret;
+    }
+
+    /* Tilt 0 is the identity: events pass through without X/Y pairing. */
+    int32_t out[3];
+    if ((ret = zmk_input_processor_runtime_set_tilt(
+             dev, 0, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY)) < 0 ||
+        (ret = process_test_xyx(dev, 3, 5, out)) < 0) {
+        return ret;
+    }
+    if (out[0] != 3 || out[1] != 5 || out[2] != 3) {
+        LOG_ERR("Identity transform changed events: %d %d %d", out[0], out[1], out[2]);
+        return -EINVAL;
+    }
+
+    /* 60 degrees along the 12-6 o'clock axis doubles Y only. */
+    if ((ret = zmk_input_processor_runtime_set_tilt(
+             dev, 60, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY)) < 0 ||
+        (ret = zmk_input_processor_runtime_set_tilt_axis(
+             dev, 0, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY)) < 0 ||
+        (ret = process_test_xyx(dev, 3, 5, out)) < 0) {
+        return ret;
+    }
+    if (out[0] != 0 || out[1] != 10 || out[2] != 3) {
+        LOG_ERR("Tilt 60 axis 0: got %d %d %d expected 0 10 3", out[0], out[1], out[2]);
+        return -EINVAL;
+    }
+
+    /* Turning the axis to 3-9 o'clock doubles X instead. */
+    if ((ret = zmk_input_processor_runtime_set_tilt_axis(
+             dev, 90, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY)) < 0 ||
+        (ret = process_test_xyx(dev, 3, 5, out)) < 0) {
+        return ret;
+    }
+    if (out[0] != 0 || out[1] != 5 || out[2] != 6) {
+        LOG_ERR("Tilt 60 axis 90: got %d %d %d expected 0 5 6", out[0], out[1], out[2]);
+        return -EINVAL;
+    }
+
+    /* The 1.414 gain at 45 degrees must not be lost to integer truncation. */
+    if ((ret = zmk_input_processor_runtime_set_tilt(
+             dev, 45, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY)) < 0 ||
+        (ret = zmk_input_processor_runtime_set_tilt_axis(
+             dev, 0, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY)) < 0) {
+        return ret;
+    }
+    int32_t total_x = 0;
+    int32_t total_y = 0;
+    for (int i = 0; i < 1000; i++) {
+        int32_t x;
+        int32_t y;
+        if ((ret = process_test_relative(dev, INPUT_REL_X, 0, &x)) < 0 ||
+            (ret = process_test_relative(dev, INPUT_REL_Y, 1, &y)) < 0) {
+            return ret;
+        }
+        total_x += x;
+        total_y += y;
+    }
+    if (total_x != 0 || total_y < 1413 || total_y > 1415) {
+        LOG_ERR("Tilt 45 carry: got x=%d y=%d expected 0/1414", total_x, total_y);
+        return -EINVAL;
+    }
+    zmk_input_processor_runtime_restore_persistent(dev);
+
+    /* v4 persistence round trip. */
+    if ((ret = zmk_input_processor_runtime_set_tilt(
+             dev, 45, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_PERSIST)) < 0 ||
+        (ret = zmk_input_processor_runtime_set_tilt_axis(
+             dev, -30, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_PERSIST)) < 0) {
+        return ret;
+    }
+    zmk_input_processor_runtime_test_flush_save(dev);
+    zmk_input_processor_runtime_reset(dev);
+    zmk_input_processor_runtime_get_config(dev, NULL, &cfg);
+    if (cfg.tilt_degrees != 0 || cfg.tilt_axis_degrees != 0) {
+        LOG_ERR("Reset did not restore tilt defaults: %u@%d", cfg.tilt_degrees,
+                cfg.tilt_axis_degrees);
+        return -EINVAL;
+    }
+    ret = settings_load_subtree("custom_settings");
+    if (ret < 0) {
+        return ret;
+    }
+    zmk_input_processor_runtime_test_apply_persisted_settings();
+    zmk_input_processor_runtime_get_config(dev, NULL, &cfg);
+    if (cfg.tilt_degrees != 45 || cfg.tilt_axis_degrees != -30) {
+        LOG_ERR("Persisted tilt not restored: got %u@%d expected 45@-30", cfg.tilt_degrees,
+                cfg.tilt_axis_degrees);
+        return -EINVAL;
+    }
+
+    /* A memory-only change is dropped by discard. */
+    if ((ret = zmk_input_processor_runtime_set_tilt(
+             dev, 30, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_MEMORY)) < 0 ||
+        (ret = zmk_input_processor_runtime_discard_all()) < 0) {
+        return ret;
+    }
+    zmk_input_processor_runtime_get_config(dev, NULL, &cfg);
+    if (cfg.tilt_degrees != 45 || cfg.tilt_axis_degrees != -30) {
+        LOG_ERR("Tilt discard did not restore flash value: got %u@%d", cfg.tilt_degrees,
+                cfg.tilt_axis_degrees);
+        return -EINVAL;
+    }
+
+    /* A v3 record (no tilt fields) upgrades with the devicetree defaults. */
+    ret = zmk_input_processor_runtime_test_apply_legacy_v3(dev);
+    if (ret < 0) {
+        return ret;
+    }
+    zmk_input_processor_runtime_get_config(dev, NULL, &cfg);
+    if (cfg.rotation_degrees != 44 || cfg.tilt_degrees != 0 || cfg.tilt_axis_degrees != 0) {
+        LOG_ERR("Legacy v3 settings were not migrated: rot=%d tilt=%u@%d", cfg.rotation_degrees,
+                cfg.tilt_degrees, cfg.tilt_axis_degrees);
+        return -EINVAL;
+    }
+
+    LOG_INF("PASS: rip_tilt_compensation");
+    return 0;
+}
+
 static int rip_settings_test_init(void) {
     int ret = test_settings_backend_init();
     if (ret < 0) {
@@ -955,6 +1150,11 @@ static int rip_settings_test_init(void) {
     ret = test_write_modes_and_save_discard();
     if (ret < 0) {
         LOG_ERR("FAIL: rip_settings_write_modes ret=%d", ret);
+    }
+
+    ret = test_tilt();
+    if (ret < 0) {
+        LOG_ERR("FAIL: rip_tilt_compensation ret=%d", ret);
     }
     return 0;
 }

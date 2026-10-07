@@ -47,6 +47,23 @@ properties:
     default: 0
     description: Initial rotation angle in degrees
 
+  tilt-degrees:
+    type: int
+    default: 0
+    description: |
+      Initial tilt compensation in degrees (0 = off). After rotation, motion
+      along the tilt axis is multiplied by 1 / cos(tilt-degrees). Clamped to
+      0..60 (60 doubles the axis); it never approaches 90, where the sensor
+      sees no motion at all.
+
+  tilt-axis-degrees:
+    type: int
+    default: 0
+    description: |
+      Initial axis boosted by tilt compensation, like a clock hand turned
+      clockwise from the 12-6 o'clock axis: 0 = up/down, 30 = 1-7 o'clock,
+      90 = left/right, -30 = 11-5 o'clock. Normalized into (-90, 90].
+
   track-remainders:
     type: boolean
     description: Track remainders for scaling operations (enabled if present)
