@@ -1,6 +1,7 @@
 import platform
 import shutil
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -101,6 +102,26 @@ class WestCommandsTests(unittest.TestCase):
                     if entry not in config_text:
                         self.fail(f"{entry} not found in {config_path} for {artifact}")
             self.assertTrue((config_path.parent / "zmk.uf2").exists(), f"{artifact} zmk.uf2 is missing in {config_path.parent}")
+
+class HostUnitTests(unittest.TestCase):
+    """Pure-C unit tests that need only a host C compiler (no west/Zephyr)."""
+
+    def test_tilt_math(self):
+        cc = shutil.which("cc") or shutil.which("gcc") or shutil.which("clang")
+        if cc is None:
+            self.skipTest("no host C compiler")
+        with tempfile.TemporaryDirectory() as tmp:
+            binary = Path(tmp) / "tilt_math_test"
+            build = subprocess.run(
+                [cc, "-std=c11", "-Wall", "-Wextra", "-Werror", "-o", str(binary),
+                 str(THIS_DIR / "tests" / "host" / "tilt_math_test.c"), "-lm"],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(build.returncode, 0, build.stdout + build.stderr)
+            result = subprocess.run([str(binary)], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("checks passed", result.stdout)
 
 if __name__ == "__main__":
     unittest.main()

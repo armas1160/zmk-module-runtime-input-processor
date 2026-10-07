@@ -512,13 +512,29 @@ Tilt compensation multiplies motion along one axis by `1 / cos(tilt)`.
 };
 ```
 
-The boost is applied after rotation, in the event codes' frame (x right,
-y down). With `d = (sin a, -cos a)` for axis `a` and `k = 1 / cos(tilt)`, the
-processor applies `M = (I + (k - 1) d d^T) * R(rotation)`, precomputed in
-fixed point x1000 (rounded) with a per-axis sub-count remainder carried
-between events, so slow 1-count movement is not lost (this also applies to
-plain rotation). When rotation and tilt are both zero, events pass through
-untouched.
+**Frame.** The tilt axis is defined in the frame after rotation and before
+this processor's axis inversion, XY swap and XY-to-scroll mapping, i.e. the
+physical frame of the (rotated) sensor, x right and y down. Correct the sensor
+mounting (mirroring, 90 degree turns) in the sensor driver (for the PMW3610:
+its swap-xy / invert options), so that the processor's invert flags stay
+output preferences (for example natural scrolling) and the same tilt axis
+value fits both the cursor and the scroll processor.
+
+**Math.** With `d = (sin a, -cos a)` for axis `a` and `k = 1 / cos(tilt)`,
+the processor applies `M = (I + (k - 1) d d^T) * R(rotation)`, precomputed in
+fixed point x1000 (rounded). Each X or Y event is transformed on its own axis
+immediately; its cross term is carried to the other axis' next event, together
+with the sub-count remainder, so slow 1-count movement is not lost (this also
+applies to plain rotation). Carried values are dropped after 100 ms without
+events and are capped at 127 counts. When rotation and tilt are both zero,
+events pass through untouched.
+
+With rotation 0 or 180 and tilt axis 0 or 90 there are no cross terms, so the
+output is exact and immediate for any driver. With other rotations or a
+diagonal tilt axis, a driver that reports only the axis that moved (the
+PMW3610 driver skips a zero axis) delays each cross term until the other axis
+next reports; a driver that reports both axes in every motion report keeps
+the lag to one report.
 
 Both values follow the same write modes as the other settings (persist /
 memory / temporary) and are saved with them. Over Studio RPC they are

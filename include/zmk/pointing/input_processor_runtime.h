@@ -114,6 +114,10 @@ int zmk_input_processor_runtime_set_tilt(const struct device *dev, uint32_t degr
  *
  * Like a clock hand, clockwise from the 12-6 o'clock (up/down) axis:
  * 0 = up/down, 30 = 1-7 o'clock, 90 = left/right, -30 = 11-5 o'clock.
+ * The axis is in the frame after rotation and before axis inversion, XY swap
+ * and XY-to-scroll mapping (the physical sensor frame); correct sensor
+ * mounting in the sensor driver. On a diagonal axis, drivers that report only
+ * the moving axis delay cross terms until the other axis reports.
  *
  * @param dev Pointer to the device structure
  * @param degrees Axis angle in degrees; normalized into (-90, 90] (180-degree periodic)

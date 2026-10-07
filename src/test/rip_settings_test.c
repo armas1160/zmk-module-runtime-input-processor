@@ -943,14 +943,29 @@ static int process_test_relative(const struct device *dev, uint16_t code, int32_
     return ret == ZMK_INPUT_PROC_CONTINUE ? 0 : -EINVAL;
 }
 
-/* Feed X then Y then X. The transform pairs each axis with the other's
- * latest value, so the first X after a transform change reports 0. */
+/* Feed X then Y then X. Each event is transformed on its own axis at once;
+ * cross terms are carried to the other axis' next event. */
 static int process_test_xyx(const struct device *dev, int32_t x, int32_t y, int32_t out[3]) {
     int ret;
     if ((ret = process_test_relative(dev, INPUT_REL_X, x, &out[0])) < 0 ||
         (ret = process_test_relative(dev, INPUT_REL_Y, y, &out[1])) < 0 ||
         (ret = process_test_relative(dev, INPUT_REL_X, x, &out[2])) < 0) {
         return ret;
+    }
+    return 0;
+}
+
+/* Feed `count` reports of one axis only, as drivers that skip a zero axis do. */
+static int process_test_single_axis_run(const struct device *dev, uint16_t code, int32_t value,
+                                        int count, int32_t *total) {
+    *total = 0;
+    for (int i = 0; i < count; i++) {
+        int32_t out;
+        int ret = process_test_relative(dev, code, value, &out);
+        if (ret < 0) {
+            return ret;
+        }
+        *total += out;
     }
     return 0;
 }
@@ -1013,7 +1028,7 @@ static int test_tilt(void) {
         return ret;
     }
 
-    /* Tilt 0 is the identity: events pass through without X/Y pairing. */
+    /* Tilt 0 is the identity: events pass through untouched. */
     int32_t out[3];
     if ((ret = zmk_input_processor_runtime_set_tilt(
              dev, 0, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY)) < 0 ||
@@ -1025,7 +1040,7 @@ static int test_tilt(void) {
         return -EINVAL;
     }
 
-    /* 60 degrees along the 12-6 o'clock axis doubles Y only. */
+    /* 60 degrees along the 12-6 o'clock axis doubles Y only, immediately. */
     if ((ret = zmk_input_processor_runtime_set_tilt(
              dev, 60, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY)) < 0 ||
         (ret = zmk_input_processor_runtime_set_tilt_axis(
@@ -1033,8 +1048,8 @@ static int test_tilt(void) {
         (ret = process_test_xyx(dev, 3, 5, out)) < 0) {
         return ret;
     }
-    if (out[0] != 0 || out[1] != 10 || out[2] != 3) {
-        LOG_ERR("Tilt 60 axis 0: got %d %d %d expected 0 10 3", out[0], out[1], out[2]);
+    if (out[0] != 3 || out[1] != 10 || out[2] != 3) {
+        LOG_ERR("Tilt 60 axis 0: got %d %d %d expected 3 10 3", out[0], out[1], out[2]);
         return -EINVAL;
     }
 
@@ -1044,12 +1059,13 @@ static int test_tilt(void) {
         (ret = process_test_xyx(dev, 3, 5, out)) < 0) {
         return ret;
     }
-    if (out[0] != 0 || out[1] != 5 || out[2] != 6) {
-        LOG_ERR("Tilt 60 axis 90: got %d %d %d expected 0 5 6", out[0], out[1], out[2]);
+    if (out[0] != 6 || out[1] != 5 || out[2] != 6) {
+        LOG_ERR("Tilt 60 axis 90: got %d %d %d expected 6 5 6", out[0], out[1], out[2]);
         return -EINVAL;
     }
 
-    /* The 1.414 gain at 45 degrees must not be lost to integer truncation. */
+    /* The 1.414 gain at 45 degrees must not be lost to integer truncation,
+     * and single-axis reports must not be dropped. */
     if ((ret = zmk_input_processor_runtime_set_tilt(
              dev, 45, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY)) < 0 ||
         (ret = zmk_input_processor_runtime_set_tilt_axis(
@@ -1058,6 +1074,16 @@ static int test_tilt(void) {
     }
     int32_t total_x = 0;
     int32_t total_y = 0;
+    if ((ret = process_test_single_axis_run(dev, INPUT_REL_X, 3, 100, &total_x)) < 0 ||
+        (ret = process_test_single_axis_run(dev, INPUT_REL_Y, 3, 100, &total_y)) < 0) {
+        return ret;
+    }
+    if (total_x != 300 || total_y < 423 || total_y > 425) {
+        LOG_ERR("Tilt 45 single-axis runs: got x=%d y=%d expected 300/424", total_x, total_y);
+        return -EINVAL;
+    }
+    total_x = 0;
+    total_y = 0;
     for (int i = 0; i < 1000; i++) {
         int32_t x;
         int32_t y;
@@ -1070,6 +1096,31 @@ static int test_tilt(void) {
     }
     if (total_x != 0 || total_y < 1413 || total_y > 1415) {
         LOG_ERR("Tilt 45 carry: got x=%d y=%d expected 0/1414", total_x, total_y);
+        return -EINVAL;
+    }
+
+    /* Rotation 90 (right to down): Y gets X's cross term in the same report,
+     * X gets Y's cross term one report later. */
+    if ((ret = zmk_input_processor_runtime_set_tilt(
+             dev, 0, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY)) < 0 ||
+        (ret = zmk_input_processor_runtime_set_rotation(
+             dev, 90, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY)) < 0) {
+        return ret;
+    }
+    total_x = 0;
+    total_y = 0;
+    for (int i = 0; i < 10; i++) {
+        int32_t x;
+        int32_t y;
+        if ((ret = process_test_relative(dev, INPUT_REL_X, 5, &x)) < 0 ||
+            (ret = process_test_relative(dev, INPUT_REL_Y, 3, &y)) < 0) {
+            return ret;
+        }
+        total_x += x;
+        total_y += y;
+    }
+    if (total_x != -27 || total_y != 50) {
+        LOG_ERR("Rotation 90 reports: got x=%d y=%d expected -27/50", total_x, total_y);
         return -EINVAL;
     }
     zmk_input_processor_runtime_restore_persistent(dev);

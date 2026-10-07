@@ -10,7 +10,12 @@
  * Kept free of Zephyr dependencies so it can be unit-tested on the host
  * (see tests/host/tilt_math_test.c).
  *
- * Coordinate frame: the event codes' frame, x to the right and y down (HID).
+ * Coordinate frame: the processor's input frame, x to the right and y down
+ * (HID). The transform runs after rotation and before the processor's axis
+ * inversion, XY swap and XY-to-scroll mapping, so the tilt axis is defined in
+ * the physical (rotated sensor) frame. Fix sensor mounting (mirroring, 90
+ * degree turns) in the sensor driver so one tilt axis value fits both the
+ * cursor and the scroll processors.
  *
  * Rotation r keeps the module's historical sign convention:
  *   x' = x cos r - y sin r
@@ -115,18 +120,69 @@ static inline bool rip_tilt_matrix_equal(const struct rip_tilt_matrix *a,
     return a->xx == b->xx && a->xy == b->xy && a->yx == b->yx && a->yy == b->yy;
 }
 
+/* Carried state is dropped when more than this much time passed since the
+ * previous transformed event, so a stale fraction or cross term cannot
+ * surface after a pause. */
+#define RIP_TRANSFORM_IDLE_RESET_MS 100
+
+/* Each carried remainder is clamped to +/-127 counts (x1000) after cross terms
+ * are added, so a long single-axis run cannot cause a big jump later. */
+#define RIP_TRANSFORM_REMAINDER_LIMIT (127 * RIP_TILT_FIXED_ONE)
+
+/* Per-processor carried state for rip_tilt_apply_event(); zero-initialize. */
+struct rip_tilt_state {
+    int32_t remainder_x; /* x1000: sub-count fraction plus pending cross terms */
+    int32_t remainder_y;
+    int64_t last_event_ms;
+};
+
+static inline int32_t rip_tilt_clamp_remainder(int64_t remainder) {
+    if (remainder > RIP_TRANSFORM_REMAINDER_LIMIT) {
+        return RIP_TRANSFORM_REMAINDER_LIMIT;
+    }
+    if (remainder < -RIP_TRANSFORM_REMAINDER_LIMIT) {
+        return -RIP_TRANSFORM_REMAINDER_LIMIT;
+    }
+    return (int32_t)remainder;
+}
+
 /*
- * One output axis: out = (remainder + m_a * a + m_b * b) / 1000, carrying the
- * signed sub-count remainder (x1000 units, |remainder| < 1000) to the next
- * call so slow movement is not lost to integer division. The result is
- * clamped to the int16 range; the remainder is dropped when clamping.
+ * Apply M to one single-axis event and return that axis' output value.
+ *
+ * Events are not paired: drivers may report only the axis that moved. An X
+ * event with value X emits (remainder_x + xx * X) / 1000 immediately, keeps
+ * the signed sub-count rest in remainder_x, and adds its cross term yx * X to
+ * remainder_y, which is emitted with the next Y event. Y events mirror this
+ * (yy for the output, xy into remainder_x).
+ *
+ * With zero off-diagonal terms (rotation 0/180, tilt axis 0/90) the output is
+ * exact and immediate for any report pattern. In a report carrying X then Y,
+ * the Y output includes that report's X cross term and the Y cross term for X
+ * lags one report; single-axis reports hold their cross terms until the other
+ * axis reports.
+ *
+ * Both remainders are cleared first when more than
+ * RIP_TRANSFORM_IDLE_RESET_MS passed since the previous event, and the cross
+ * term remainder is clamped to RIP_TRANSFORM_REMAINDER_LIMIT. The output is
+ * clamped to the int16 range (dropping the rest when clamping).
  */
-static inline int16_t rip_tilt_apply_axis(int32_t m_a, int32_t m_b, int16_t a, int16_t b,
-                                          int32_t *remainder) {
-    int64_t numerator = (int64_t)*remainder + (int64_t)m_a * a + (int64_t)m_b * b;
+static inline int16_t rip_tilt_apply_event(const struct rip_tilt_matrix *m, bool is_x,
+                                           int16_t value, int64_t now_ms,
+                                           struct rip_tilt_state *state) {
+    if (now_ms - state->last_event_ms > RIP_TRANSFORM_IDLE_RESET_MS) {
+        state->remainder_x = 0;
+        state->remainder_y = 0;
+    }
+    state->last_event_ms = now_ms;
+
+    int32_t *own = is_x ? &state->remainder_x : &state->remainder_y;
+    int32_t *cross = is_x ? &state->remainder_y : &state->remainder_x;
+    int32_t m_own = is_x ? m->xx : m->yy;
+    int32_t m_cross = is_x ? m->yx : m->xy;
+
+    int64_t numerator = (int64_t)*own + (int64_t)m_own * value;
     int64_t out = numerator / RIP_TILT_FIXED_ONE;
     int64_t rest = numerator - out * RIP_TILT_FIXED_ONE;
-
     if (out > INT16_MAX) {
         out = INT16_MAX;
         rest = 0;
@@ -134,7 +190,8 @@ static inline int16_t rip_tilt_apply_axis(int32_t m_a, int32_t m_b, int16_t a, i
         out = INT16_MIN;
         rest = 0;
     }
+    *own = (int32_t)rest;
+    *cross = rip_tilt_clamp_remainder((int64_t)*cross + (int64_t)m_cross * value);
 
-    *remainder = (int32_t)rest;
     return (int16_t)out;
 }

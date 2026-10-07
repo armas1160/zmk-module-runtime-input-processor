@@ -126,15 +126,8 @@ struct runtime_processor_data {
     // Precomputed rotation + tilt transform (x1000, see rip_tilt_math.h)
     struct rip_tilt_matrix transform;
     bool transform_identity;
-    // Sub-count remainders (x1000) carried between events per output axis
-    int32_t transform_remainder_x;
-    int32_t transform_remainder_y;
-
-    // Last seen X/Y values for rotation
-    int16_t last_x;
-    int16_t last_y;
-    bool has_x;
-    bool has_y;
+    // Per-axis remainders (x1000) and cross terms carried between events
+    struct rip_tilt_state transform_state;
 
     // Temp-layer layer settings
     bool temp_layer_enabled;
@@ -231,20 +224,15 @@ struct runtime_processor_data {
 };
 
 /* Recompute the combined rotation + tilt matrix. Call whenever rotation, tilt
- * or tilt axis changes. A changed matrix restarts the X/Y pairing and drops
- * the carried remainders so no sample from the old transform leaks out. */
+ * or tilt axis changes. A changed matrix drops the carried remainders so no
+ * fraction or cross term from the old transform leaks out. */
 static void update_rotation_values(struct runtime_processor_data *data) {
     struct rip_tilt_matrix transform = rip_tilt_compute_matrix(
         data->rotation_degrees, data->tilt_degrees, data->tilt_axis_degrees);
 
     if (!rip_tilt_matrix_equal(&transform, &data->transform)) {
         data->transform = transform;
-        data->transform_remainder_x = 0;
-        data->transform_remainder_y = 0;
-        data->has_x = false;
-        data->has_y = false;
-        data->last_x = 0;
-        data->last_y = 0;
+        data->transform_state = (struct rip_tilt_state){0};
     }
     data->transform_identity = rip_tilt_matrix_is_identity(&transform);
 
@@ -927,37 +915,13 @@ static int runtime_processor_handle_event(const struct device *dev, struct input
     }
 
     // Apply rotation and tilt compensation: M = M_tilt * R(rotation), x1000
-    // fixed point with a per-axis remainder carry (see rip_tilt_math.h).
-    // Skipped entirely when M is the identity (rotation 0 and tilt 0).
+    // fixed point. Each event is applied on its own axis at once; its cross
+    // term is carried to the other axis' next event (see rip_tilt_math.h), so
+    // drivers that report only the moving axis lose nothing. Skipped entirely
+    // when M is the identity (rotation 0 and tilt 0).
     if (!data->transform_identity) {
-        const struct rip_tilt_matrix *m = &data->transform;
-        if (is_x) {
-            data->last_x = value;
-            data->has_x = true;
-
-            // If we have both X and Y, apply the transform
-            if (data->has_y) {
-                // X' = xx * X + xy * Y
-                event->value = rip_tilt_apply_axis(m->xx, m->xy, data->last_x, data->last_y,
-                                                   &data->transform_remainder_x);
-                data->has_y = false;
-            } else {
-                event->value = 0;
-            }
-        } else {
-            data->last_y = value;
-            data->has_y = true;
-
-            // If we have both X and Y, apply the transform
-            if (data->has_x) {
-                // Y' = yx * X + yy * Y
-                event->value = rip_tilt_apply_axis(m->yx, m->yy, data->last_x, data->last_y,
-                                                   &data->transform_remainder_y);
-                data->has_x = false;
-            } else {
-                event->value = 0;
-            }
-        }
+        event->value = rip_tilt_apply_event(&data->transform, is_x, value, k_uptime_get(),
+                                            &data->transform_state);
     }
 
     // Apply axis inversion after rotation
@@ -1414,12 +1378,6 @@ static int runtime_processor_init(const struct device *dev) {
     data->persistent_tilt_degrees = data->tilt_degrees;
     data->persistent_tilt_axis_degrees = data->tilt_axis_degrees;
 
-    // Initialize rotation state
-    data->has_x = false;
-    data->has_y = false;
-    data->last_x = 0;
-    data->last_y = 0;
-
     // Initialize temp-layer settings from DT defaults
     data->temp_layer_enabled = cfg->initial_temp_layer_enabled;
     data->temp_layer_layer = cfg->initial_temp_layer_layer;
@@ -1838,6 +1796,8 @@ int zmk_input_processor_runtime_get_config(const struct device *dev, const char 
     return 0;
 }
 
+/* The (int32_t) casts on angle properties: edtlib emits negative DT ints as
+ * unsigned literals. */
 #define RUNTIME_PROCESSOR_INST(n)                                                                  \
     static const uint16_t runtime_x_codes_##n[] = DT_INST_PROP(n, x_codes);                        \
     static const uint16_t runtime_y_codes_##n[] = DT_INST_PROP(n, y_codes);                        \
@@ -1864,9 +1824,9 @@ int zmk_input_processor_runtime_get_config(const struct device *dev, const char 
         .y_codes = runtime_y_codes_##n,                                                            \
         .initial_scale_multiplier = DT_INST_PROP_OR(n, scale_multiplier, 1),                       \
         .initial_scale_divisor = DT_INST_PROP_OR(n, scale_divisor, 1),                             \
-        .initial_rotation_degrees = DT_INST_PROP_OR(n, rotation_degrees, 0),                       \
-        .initial_tilt_degrees = DT_INST_PROP_OR(n, tilt_degrees, 0),                               \
-        .initial_tilt_axis_degrees = DT_INST_PROP_OR(n, tilt_axis_degrees, 0),                     \
+        .initial_rotation_degrees = (int32_t)DT_INST_PROP_OR(n, rotation_degrees, 0),              \
+        .initial_tilt_degrees = (int32_t)DT_INST_PROP_OR(n, tilt_degrees, 0),                      \
+        .initial_tilt_axis_degrees = (int32_t)DT_INST_PROP_OR(n, tilt_axis_degrees, 0),            \
         .temp_layer_transparent_behavior = COND_CODE_1(                                            \
             DT_INST_NODE_HAS_PROP(n, temp_layer_transparent_behavior),                             \
             (DEVICE_DT_GET(DT_INST_PHANDLE(n, temp_layer_transparent_behavior))), (NULL)),         \

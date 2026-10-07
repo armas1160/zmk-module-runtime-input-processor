@@ -63,6 +63,11 @@ properties:
       Initial axis boosted by tilt compensation, like a clock hand turned
       clockwise from the 12-6 o'clock axis: 0 = up/down, 30 = 1-7 o'clock,
       90 = left/right, -30 = 11-5 o'clock. Normalized into (-90, 90].
+      Defined in the frame after rotation and before x-invert / y-invert,
+      xy-swap and xy-to-scroll (the physical sensor frame); fix sensor
+      mounting in the sensor driver. With a diagonal axis, drivers that
+      report only the moving axis delay the cross terms until the other axis
+      reports; prefer reporting both axes per motion report.
 
   track-remainders:
     type: boolean
