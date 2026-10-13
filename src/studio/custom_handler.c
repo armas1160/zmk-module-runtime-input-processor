@@ -63,6 +63,7 @@ static int handle_set_rotation(const cormoran_rip_SetRotationRequest *req,
 static int handle_set_tilt(const cormoran_rip_SetTiltRequest *req, cormoran_rip_Response *resp);
 static int handle_set_tilt_axis(const cormoran_rip_SetTiltAxisRequest *req,
                                 cormoran_rip_Response *resp);
+static int handle_set_accel(const cormoran_rip_SetAccelRequest *req, cormoran_rip_Response *resp);
 static int handle_reset_input_processor(const cormoran_rip_ResetInputProcessorRequest *req,
                                         cormoran_rip_Response *resp);
 static int handle_set_temp_layer_enabled(const cormoran_rip_SetTempLayerEnabledRequest *req,
@@ -162,6 +163,9 @@ static bool rip_rpc_handle_request(const zmk_custom_CallRequest *raw_request,
         break;
     case cormoran_rip_Request_set_tilt_axis_tag:
         rc = handle_set_tilt_axis(&req.request_type.set_tilt_axis, resp);
+        break;
+    case cormoran_rip_Request_set_accel_tag:
+        rc = handle_set_accel(&req.request_type.set_accel, resp);
         break;
     case cormoran_rip_Request_reset_input_processor_tag:
         rc = handle_reset_input_processor(&req.request_type.reset_input_processor, resp);
@@ -351,6 +355,8 @@ static int handle_get_input_processor(const cormoran_rip_GetInputProcessorReques
     result.processor.tilt_degrees = config.tilt_degrees;
     result.processor.tilt_axis_degrees = config.tilt_axis_degrees;
     result.processor.tilt_supported = true;
+    result.processor.accel_min_percent = config.accel_min_percent;
+    result.processor.accel_supported = true;
     result.processor.temp_layer_enabled = config.temp_layer_enabled;
     result.processor.temp_layer_layer = config.temp_layer_layer;
     result.processor.temp_layer_activation_delay_ms = config.temp_layer_activation_delay_ms;
@@ -532,6 +538,34 @@ static int handle_set_tilt_axis(const cormoran_rip_SetTiltAxisRequest *req,
     resp->which_response_type = cormoran_rip_Response_set_tilt_axis_tag;
     resp->response_type.set_tilt_axis =
         (cormoran_rip_SetTiltAxisResponse)cormoran_rip_SetTiltAxisResponse_init_zero;
+
+    return 0;
+}
+
+/**
+ * Handle setting the pointer acceleration low-speed gain (clamped to 20..100)
+ */
+static int handle_set_accel(const cormoran_rip_SetAccelRequest *req, cormoran_rip_Response *resp) {
+    LOG_DBG("Setting accel for id=%d to %u%%", req->id, req->value);
+
+    const struct device *dev = zmk_input_processor_runtime_find_by_id(req->id);
+    if (!dev) {
+        LOG_WRN("Input processor not found: id=%d", req->id);
+        return -ENODEV;
+    }
+
+    // Set acceleration (write mode per request)
+    int ret =
+        zmk_input_processor_runtime_set_accel(dev, req->value, rip_write_mode(req->write_mode));
+    if (ret < 0) {
+        LOG_ERR("Failed to set accel: %d", ret);
+        return ret;
+    }
+
+    // Return empty response
+    resp->which_response_type = cormoran_rip_Response_set_accel_tag;
+    resp->response_type.set_accel =
+        (cormoran_rip_SetAccelResponse)cormoran_rip_SetAccelResponse_init_zero;
 
     return 0;
 }

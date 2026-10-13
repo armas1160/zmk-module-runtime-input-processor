@@ -41,6 +41,8 @@ struct zmk_input_processor_runtime_config {
     // Tilt compensation settings
     uint8_t tilt_degrees;      // 0..60, 0 = off; boost 1/cos(tilt) along the tilt axis
     int16_t tilt_axis_degrees; // (-90, 90], clockwise from up/down (90 = left/right)
+    // Pointer acceleration: gain at low speed in percent (20..100, 100 = off)
+    uint8_t accel_min_percent;
     // Temp-layer layer settings
     bool temp_layer_enabled;
     uint8_t temp_layer_layer;
@@ -126,6 +128,22 @@ int zmk_input_processor_runtime_set_tilt(const struct device *dev, uint32_t degr
  */
 int zmk_input_processor_runtime_set_tilt_axis(const struct device *dev, int32_t degrees,
                                               enum zmk_input_processor_runtime_write_mode mode);
+
+/**
+ * @brief Set the low-speed gain of pointer acceleration ("precision at low speed")
+ *
+ * Input at or below the devicetree accel-speed-low (counts per 100 ms) is
+ * multiplied by percent / 100; at or above accel-speed-high it is unchanged,
+ * with a smooth curve in between. Measured and applied after rotation, tilt,
+ * inversion and axis snap, before scaling. 100 disables it.
+ *
+ * @param dev Pointer to the device structure
+ * @param percent Gain at low speed in percent; clamped to 20..100 (100 = off)
+ * @param mode Where to store the value (persist to flash, memory-only, or temporary)
+ * @return 0 on success, negative error code on failure
+ */
+int zmk_input_processor_runtime_set_accel(const struct device *dev, uint32_t percent,
+                                          enum zmk_input_processor_runtime_write_mode mode);
 
 /**
  * @brief Reset processor to default values and save to persistent storage
@@ -484,6 +502,9 @@ int zmk_input_processor_runtime_test_apply_legacy_v2(const struct device *dev);
 
 /** @brief Test-only: apply a v3 blob (rotation 44) without the tilt fields. */
 int zmk_input_processor_runtime_test_apply_legacy_v3(const struct device *dev);
+
+/** @brief Test-only: apply a v4 blob (rotation 45) without the acceleration field. */
+int zmk_input_processor_runtime_test_apply_legacy_v4(const struct device *dev);
 
 /** @brief Test-only: verify timed report splitting and rolling expiration. */
 int zmk_input_processor_runtime_test_inertia_sliding_window(void);

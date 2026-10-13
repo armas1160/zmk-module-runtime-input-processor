@@ -58,6 +58,9 @@ message InputProcessorInfo {
     uint32 tilt_degrees = 30;       // 0..60, 0 = off. Boost 1/cos(tilt) along the tilt axis
     int32 tilt_axis_degrees = 31;   // (-90, 90], clockwise from the up/down axis (0 = up/down, 90 = left/right)
     bool tilt_supported = 32;       // always true in this fork, so clients can detect support
+    // Pointer acceleration ("precision at low speed")
+    uint32 accel_min_percent = 33;  // 20..100, gain at low speed; 100 = acceleration off
+    bool accel_supported = 34;      // always true in this fork, so clients can detect support
 }
 
 message ListInputProcessorsRequest {
@@ -335,6 +338,14 @@ message SetTiltAxisRequest {
 }
 message SetTiltAxisResponse {}
 
+// Pointer acceleration: out-of-range values are clamped, not rejected.
+message SetAccelRequest {
+    uint32 id = 1;
+    uint32 value = 2;         // Gain at low speed in percent, clamped to 20..100 (100 = off)
+    WriteMode write_mode = 3; // Where to store the value (default: persist)
+}
+message SetAccelResponse {}
+
 // Persist every processor's current in-memory settings to flash. Flushes values
 // that were set with WRITE_MODE_MEMORY.
 message SaveAllSettingsRequest {
@@ -401,6 +412,7 @@ message Request {
         SetInertiaNormalMaxOutputRequest set_inertia_normal_max_output = 33;
         SetTiltRequest set_tilt = 34;
         SetTiltAxisRequest set_tilt_axis = 35;
+        SetAccelRequest set_accel = 36;
     }
 }
 
@@ -443,6 +455,7 @@ message Response {
         SetInertiaNormalMaxOutputResponse set_inertia_normal_max_output = 34;
         SetTiltResponse set_tilt = 35;
         SetTiltAxisResponse set_tilt_axis = 36;
+        SetAccelResponse set_accel = 37;
     }
 }
 

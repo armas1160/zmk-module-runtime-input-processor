@@ -27,6 +27,15 @@ config ZMK_RUNTIME_INPUT_PROCESSOR_INERTIA_REVERSE_EXIT_MAX
     range 1 65535
     default 12
 
+config ZMK_RUNTIME_INPUT_PROCESSOR_ACCEL_WINDOW_MS
+    int "Pointer acceleration speed window in milliseconds"
+    range 10 500
+    default 40
+    help
+      Pointer acceleration (accel-min-percent) estimates speed from the X/Y
+      input of this window. Each processor keeps its last 32 X/Y events, so
+      a long window with a fast report rate only sees the newest 32.
+
 config ZMK_RUNTIME_INPUT_PROCESSOR_STUDIO_RPC
     bool "Enable runtime input processor custom Studio RPC"
     depends on ZMK_STUDIO

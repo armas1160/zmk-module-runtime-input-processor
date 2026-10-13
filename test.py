@@ -123,5 +123,22 @@ class HostUnitTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn("checks passed", result.stdout)
 
+    def test_accel_math(self):
+        cc = shutil.which("cc") or shutil.which("gcc") or shutil.which("clang")
+        if cc is None:
+            self.skipTest("no host C compiler")
+        with tempfile.TemporaryDirectory() as tmp:
+            binary = Path(tmp) / "accel_math_test"
+            build = subprocess.run(
+                [cc, "-std=c11", "-Wall", "-Wextra", "-Werror", "-o", str(binary),
+                 str(THIS_DIR / "tests" / "host" / "accel_math_test.c"), "-lm"],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(build.returncode, 0, build.stdout + build.stderr)
+            result = subprocess.run([str(binary)], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("checks passed", result.stdout)
+
 if __name__ == "__main__":
     unittest.main()

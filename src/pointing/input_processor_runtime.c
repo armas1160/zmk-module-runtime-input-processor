@@ -31,6 +31,7 @@
 #include <zmk/keymap.h>
 #include <zmk/keys.h>
 
+#include "rip_accel_math.h"
 #include "rip_tilt_math.h"
 
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
@@ -48,6 +49,10 @@ struct runtime_processor_config {
     // Tilt compensation defaults from DT (clamped/normalized when applied)
     int32_t initial_tilt_degrees;
     int32_t initial_tilt_axis_degrees;
+    // Pointer acceleration defaults from DT (speeds in counts per 100 ms)
+    int32_t initial_accel_min_percent;
+    uint32_t accel_speed_low;
+    uint32_t accel_speed_high;
     // Temp-layer behavior references for efficient comparison
     const struct device *temp_layer_transparent_behavior;
     const struct device *temp_layer_kp_behavior;
@@ -84,6 +89,9 @@ struct runtime_processor_config {
 #define INERTIA_BUCKETS CONFIG_ZMK_RUNTIME_INPUT_PROCESSOR_INERTIA_BUCKETS
 #define INERTIA_WINDOW_SLICES CONFIG_ZMK_RUNTIME_INPUT_PROCESSOR_INERTIA_WINDOW_SLICES
 
+/* Pointer acceleration speed window (see rip_accel_math.h). */
+#define ACCEL_WINDOW_MS CONFIG_ZMK_RUNTIME_INPUT_PROCESSOR_ACCEL_WINDOW_MS
+
 BUILD_ASSERT(INERTIA_BUCKETS >= INERTIA_WINDOW_SLICES + 2,
              "Inertia bucket count must exceed window slices by at least two");
 BUILD_ASSERT(CONFIG_ZMK_RUNTIME_INPUT_PROCESSOR_INERTIA_REVERSE_EXIT_MIN <=
@@ -115,6 +123,7 @@ struct runtime_processor_data {
     int32_t rotation_degrees;
     uint8_t tilt_degrees;      // [0, RIP_TILT_MAX_DEGREES]
     int16_t tilt_axis_degrees; // (-90, 90], clockwise from up/down
+    uint8_t accel_min_percent; // [RIP_ACCEL_MIN_PERCENT, 100], 100 = off
 
     // Persistent values (saved to settings, not affected by behavior)
     uint32_t persistent_scale_multiplier;
@@ -122,12 +131,17 @@ struct runtime_processor_data {
     int32_t persistent_rotation_degrees;
     uint8_t persistent_tilt_degrees;
     int16_t persistent_tilt_axis_degrees;
+    uint8_t persistent_accel_min_percent;
 
     // Precomputed rotation + tilt transform (x1000, see rip_tilt_math.h)
     struct rip_tilt_matrix transform;
     bool transform_identity;
     // Per-axis remainders (x1000) and cross terms carried between events
     struct rip_tilt_state transform_state;
+
+    // Recent input for the acceleration speed estimate and per-axis
+    // remainders (permille, see rip_accel_math.h)
+    struct rip_accel_state accel_state;
 
     // Temp-layer layer settings
     bool temp_layer_enabled;
@@ -868,6 +882,9 @@ static int runtime_processor_handle_event(const struct device *dev, struct input
         if (data->inertia_active) {
             inertia_stop(data, ZMK_INPUT_PROCESSOR_INERTIA_STOP_REASON_LAYER_INACTIVE);
         }
+        if (data->accel_state.count != 0) {
+            data->accel_state = (struct rip_accel_state){0};
+        }
         return ZMK_INPUT_PROC_CONTINUE;
     }
 
@@ -1028,6 +1045,16 @@ static int runtime_processor_handle_event(const struct device *dev, struct input
     // its entry threshold remains in the units seen by the user.
     int16_t inertia_raw_value = event->value;
 
+    // Speed-dependent pointer acceleration (see rip_accel_math.h): slow motion
+    // gets accel_min_percent, fast motion stays 1:1. Runs before scaling and
+    // after inertia_raw_value, so inertia still measures the raw input.
+    // Skipped entirely when off (100%).
+    if (data->accel_min_percent < RIP_ACCEL_OFF_PERCENT) {
+        event->value = rip_accel_apply_event(
+            &data->accel_state, is_x, event->value, (uint32_t)k_uptime_get(), ACCEL_WINDOW_MS,
+            data->accel_min_percent, cfg->accel_speed_low, cfg->accel_speed_high);
+    }
+
     // Apply scaling
     if (data->scale_multiplier > 0 && data->scale_divisor > 0) {
         scale_val(event, data->scale_multiplier, data->scale_divisor, state);
@@ -1073,7 +1100,7 @@ static struct zmk_input_processor_driver_api runtime_processor_driver_api = {
  * see the load path below), so the generic surface is for visibility/inspection.
  */
 #define RIP_SETTINGS_SUBSYSTEM_ID "cormoran_rip"
-#define RIP_SETTINGS_BLOB_VERSION 4
+#define RIP_SETTINGS_BLOB_VERSION 5
 
 /*
  * The persisted-on-flash v1 struct for one processor's original 15 settings
@@ -1131,7 +1158,15 @@ struct rip_persist_v4 {
     int16_t tilt_axis_degrees;
 };
 
-#define RIP_SETTINGS_BLOB_SIZE (1 + sizeof(struct rip_persist_v4))
+/* v5 adds pointer acceleration. Naturally aligned it would pad to 64 bytes
+ * (a 65-byte blob, over the 64-byte value), so it is packed: 1 + sizeof(v5)
+ * is 62 bytes on 32-bit ARM. Only ever copied whole with memcpy. */
+struct rip_persist_v5 {
+    struct rip_persist_v4 v4;
+    uint8_t accel_min_percent;
+} __packed;
+
+#define RIP_SETTINGS_BLOB_SIZE (1 + sizeof(struct rip_persist_v5))
 
 BUILD_ASSERT(RIP_SETTINGS_BLOB_SIZE <= CONFIG_ZMK_CUSTOM_SETTINGS_VALUE_MAX_SIZE,
              "runtime input processor settings blob exceeds "
@@ -1149,40 +1184,43 @@ BUILD_ASSERT(RIP_SETTINGS_BLOB_SIZE <= CONFIG_ZMK_CUSTOM_SETTINGS_VALUE_MAX_SIZE
  * and returns the number of bytes written. Version byte is written separately
  * from the struct memcpy so no wrapper-struct padding enters the layout. */
 static size_t pack_processor_settings(const struct runtime_processor_data *data, uint8_t *buf) {
-    struct rip_persist_v4 settings = {
-        .v3 = {
-            .v2 = {
-                .v1 = {
-                    .scale_multiplier = data->persistent_scale_multiplier,
-                    .scale_divisor = data->persistent_scale_divisor,
-                    .rotation_degrees = data->persistent_rotation_degrees,
-                    .temp_layer_enabled = data->persistent_temp_layer_enabled,
-                    .temp_layer_layer = data->persistent_temp_layer_layer,
-                    .temp_layer_activation_delay_ms =
-                        data->persistent_temp_layer_activation_delay_ms,
-                    .temp_layer_deactivation_delay_ms =
-                        data->persistent_temp_layer_deactivation_delay_ms,
-                    .active_layers = data->persistent_active_layers,
-                    .axis_snap_mode = data->persistent_axis_snap_mode,
-                    .axis_snap_threshold = data->persistent_axis_snap_threshold,
-                    .axis_snap_timeout_ms = data->persistent_axis_snap_timeout_ms,
-                    .xy_to_scroll_enabled = data->persistent_xy_to_scroll_enabled,
-                    .xy_swap_enabled = data->persistent_xy_swap_enabled,
-                    .x_invert = data->persistent_x_invert,
-                    .y_invert = data->persistent_y_invert,
+    struct rip_persist_v5 settings = {
+        .v4 = {
+            .v3 = {
+                .v2 = {
+                    .v1 = {
+                        .scale_multiplier = data->persistent_scale_multiplier,
+                        .scale_divisor = data->persistent_scale_divisor,
+                        .rotation_degrees = data->persistent_rotation_degrees,
+                        .temp_layer_enabled = data->persistent_temp_layer_enabled,
+                        .temp_layer_layer = data->persistent_temp_layer_layer,
+                        .temp_layer_activation_delay_ms =
+                            data->persistent_temp_layer_activation_delay_ms,
+                        .temp_layer_deactivation_delay_ms =
+                            data->persistent_temp_layer_deactivation_delay_ms,
+                        .active_layers = data->persistent_active_layers,
+                        .axis_snap_mode = data->persistent_axis_snap_mode,
+                        .axis_snap_threshold = data->persistent_axis_snap_threshold,
+                        .axis_snap_timeout_ms = data->persistent_axis_snap_timeout_ms,
+                        .xy_to_scroll_enabled = data->persistent_xy_to_scroll_enabled,
+                        .xy_swap_enabled = data->persistent_xy_swap_enabled,
+                        .x_invert = data->persistent_x_invert,
+                        .y_invert = data->persistent_y_invert,
+                    },
+                    .inertia_enabled = data->persistent_inertia_enabled,
+                    .inertia_window_ms = data->persistent_inertia_window_ms,
+                    .inertia_interval_ms = data->persistent_inertia_interval_ms,
+                    .inertia_threshold = data->persistent_inertia_threshold,
+                    .inertia_decay_percent = data->persistent_inertia_decay_percent,
+                    .inertia_fast_threshold = data->persistent_inertia_fast_threshold,
+                    .inertia_fast_output_percent = data->persistent_inertia_fast_output_percent,
                 },
-                .inertia_enabled = data->persistent_inertia_enabled,
-                .inertia_window_ms = data->persistent_inertia_window_ms,
-                .inertia_interval_ms = data->persistent_inertia_interval_ms,
-                .inertia_threshold = data->persistent_inertia_threshold,
-                .inertia_decay_percent = data->persistent_inertia_decay_percent,
-                .inertia_fast_threshold = data->persistent_inertia_fast_threshold,
-                .inertia_fast_output_percent = data->persistent_inertia_fast_output_percent,
+                .inertia_normal_max_output = data->persistent_inertia_normal_max_output,
             },
-            .inertia_normal_max_output = data->persistent_inertia_normal_max_output,
+            .tilt_degrees = data->persistent_tilt_degrees,
+            .tilt_axis_degrees = data->persistent_tilt_axis_degrees,
         },
-        .tilt_degrees = data->persistent_tilt_degrees,
-        .tilt_axis_degrees = data->persistent_tilt_axis_degrees,
+        .accel_min_percent = data->persistent_accel_min_percent,
     };
     buf[0] = RIP_SETTINGS_BLOB_VERSION;
     memcpy(&buf[1], &settings, sizeof(settings));
@@ -1190,7 +1228,8 @@ static size_t pack_processor_settings(const struct runtime_processor_data *data,
 }
 
 /* v1 has no inertia fields; start from the current devicetree defaults.
- * v1-v3 have no tilt fields; those take the devicetree defaults. */
+ * v1-v3 have no tilt fields and v1-v4 no acceleration field; those take the
+ * devicetree defaults. */
 static int unpack_and_apply_processor_settings(struct runtime_processor_data *data,
                                                const uint8_t *buf, size_t len) {
     const struct runtime_processor_config *cfg = data->dev->config;
@@ -1198,6 +1237,7 @@ static int unpack_and_apply_processor_settings(struct runtime_processor_data *da
     uint16_t normal_max_output = data->persistent_inertia_normal_max_output;
     uint8_t tilt_degrees = rip_tilt_clamp_degrees(cfg->initial_tilt_degrees);
     int16_t tilt_axis_degrees = rip_tilt_normalize_axis_degrees(cfg->initial_tilt_axis_degrees);
+    uint8_t accel_min_percent = rip_accel_clamp_min_percent(cfg->initial_accel_min_percent);
     if (len == 1 + sizeof(struct rip_persist_v1) && buf[0] == 1) {
         memcpy(&settings.v1, &buf[1], sizeof(settings.v1));
         settings.inertia_enabled = data->persistent_inertia_enabled;
@@ -1214,13 +1254,21 @@ static int unpack_and_apply_processor_settings(struct runtime_processor_data *da
         memcpy(&saved, &buf[1], sizeof(saved));
         settings = saved.v2;
         normal_max_output = saved.inertia_normal_max_output;
-    } else if (len == RIP_SETTINGS_BLOB_SIZE && buf[0] == RIP_SETTINGS_BLOB_VERSION) {
+    } else if (len == 1 + sizeof(struct rip_persist_v4) && buf[0] == 4) {
         struct rip_persist_v4 saved;
         memcpy(&saved, &buf[1], sizeof(saved));
         settings = saved.v3.v2;
         normal_max_output = saved.v3.inertia_normal_max_output;
         tilt_degrees = saved.tilt_degrees;
         tilt_axis_degrees = saved.tilt_axis_degrees;
+    } else if (len == RIP_SETTINGS_BLOB_SIZE && buf[0] == RIP_SETTINGS_BLOB_VERSION) {
+        struct rip_persist_v5 saved;
+        memcpy(&saved, &buf[1], sizeof(saved));
+        settings = saved.v4.v3.v2;
+        normal_max_output = saved.v4.v3.inertia_normal_max_output;
+        tilt_degrees = saved.v4.tilt_degrees;
+        tilt_axis_degrees = saved.v4.tilt_axis_degrees;
+        accel_min_percent = saved.accel_min_percent;
     } else {
         return -EINVAL;
     }
@@ -1236,6 +1284,9 @@ static int unpack_and_apply_processor_settings(struct runtime_processor_data *da
     if (tilt_degrees > RIP_TILT_MAX_DEGREES || tilt_axis_degrees <= -90 || tilt_axis_degrees > 90) {
         return -EINVAL;
     }
+    if (accel_min_percent < RIP_ACCEL_MIN_PERCENT || accel_min_percent > RIP_ACCEL_OFF_PERCENT) {
+        return -EINVAL;
+    }
 
     const struct rip_persist_v1 *v1 = &settings.v1;
     data->persistent_scale_multiplier = data->scale_multiplier = v1->scale_multiplier;
@@ -1243,6 +1294,8 @@ static int unpack_and_apply_processor_settings(struct runtime_processor_data *da
     data->persistent_rotation_degrees = data->rotation_degrees = v1->rotation_degrees;
     data->persistent_tilt_degrees = data->tilt_degrees = tilt_degrees;
     data->persistent_tilt_axis_degrees = data->tilt_axis_degrees = tilt_axis_degrees;
+    data->persistent_accel_min_percent = data->accel_min_percent = accel_min_percent;
+    data->accel_state = (struct rip_accel_state){0};
     data->persistent_temp_layer_enabled = data->temp_layer_enabled = v1->temp_layer_enabled;
     data->persistent_temp_layer_layer = data->temp_layer_layer = v1->temp_layer_layer;
     data->persistent_temp_layer_activation_delay_ms = data->temp_layer_activation_delay_ms =
@@ -1319,6 +1372,21 @@ int zmk_input_processor_runtime_test_apply_legacy_v3(const struct device *dev) {
     memcpy(&blob[1], &settings, sizeof(settings));
     return unpack_and_apply_processor_settings(data, blob, sizeof(blob));
 }
+
+int zmk_input_processor_runtime_test_apply_legacy_v4(const struct device *dev) {
+    if (!dev) {
+        return -EINVAL;
+    }
+    struct runtime_processor_data *data = dev->data;
+    uint8_t current[RIP_SETTINGS_BLOB_SIZE];
+    pack_processor_settings(data, current);
+    struct rip_persist_v4 settings;
+    memcpy(&settings, &current[1], sizeof(settings));
+    settings.v3.v2.v1.rotation_degrees = 45;
+    uint8_t blob[1 + sizeof(settings)] = {4};
+    memcpy(&blob[1], &settings, sizeof(settings));
+    return unpack_and_apply_processor_settings(data, blob, sizeof(blob));
+}
 #endif
 
 /* Pack the processor's current baseline and flush it to flash immediately. */
@@ -1373,6 +1441,7 @@ static int runtime_processor_init(const struct device *dev) {
     data->rotation_degrees = cfg->initial_rotation_degrees;
     data->tilt_degrees = rip_tilt_clamp_degrees(cfg->initial_tilt_degrees);
     data->tilt_axis_degrees = rip_tilt_normalize_axis_degrees(cfg->initial_tilt_axis_degrees);
+    data->accel_min_percent = rip_accel_clamp_min_percent(cfg->initial_accel_min_percent);
 
     // Initialize persistent values same as current
     data->persistent_scale_multiplier = cfg->initial_scale_multiplier;
@@ -1380,6 +1449,8 @@ static int runtime_processor_init(const struct device *dev) {
     data->persistent_rotation_degrees = cfg->initial_rotation_degrees;
     data->persistent_tilt_degrees = data->tilt_degrees;
     data->persistent_tilt_axis_degrees = data->tilt_axis_degrees;
+    data->persistent_accel_min_percent = data->accel_min_percent;
+    data->accel_state = (struct rip_accel_state){0};
 
     // Initialize temp-layer settings from DT defaults
     data->temp_layer_enabled = cfg->initial_temp_layer_enabled;
@@ -1538,11 +1609,14 @@ static void load_processor_defaults(const struct device *dev) {
     data->rotation_degrees = cfg->initial_rotation_degrees;
     data->tilt_degrees = rip_tilt_clamp_degrees(cfg->initial_tilt_degrees);
     data->tilt_axis_degrees = rip_tilt_normalize_axis_degrees(cfg->initial_tilt_axis_degrees);
+    data->accel_min_percent = rip_accel_clamp_min_percent(cfg->initial_accel_min_percent);
     data->persistent_scale_multiplier = cfg->initial_scale_multiplier;
     data->persistent_scale_divisor = cfg->initial_scale_divisor;
     data->persistent_rotation_degrees = cfg->initial_rotation_degrees;
     data->persistent_tilt_degrees = data->tilt_degrees;
     data->persistent_tilt_axis_degrees = data->tilt_axis_degrees;
+    data->persistent_accel_min_percent = data->accel_min_percent;
+    data->accel_state = (struct rip_accel_state){0};
 
     data->temp_layer_enabled = cfg->initial_temp_layer_enabled;
     data->temp_layer_layer = cfg->initial_temp_layer_layer;
@@ -1694,6 +1768,26 @@ int zmk_input_processor_runtime_set_tilt_axis(const struct device *dev, int32_t 
     return commit_write(dev, mode);
 }
 
+int zmk_input_processor_runtime_set_accel(const struct device *dev, uint32_t percent,
+                                          enum zmk_input_processor_runtime_write_mode mode) {
+    if (!dev) {
+        return -EINVAL;
+    }
+
+    struct runtime_processor_data *data = dev->data;
+    uint8_t accel = rip_accel_clamp_min_percent(percent);
+    data->accel_min_percent = accel;
+    if (mode != ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY) {
+        data->persistent_accel_min_percent = accel;
+    }
+    // Speed history and remainders from the old curve must not leak out
+    data->accel_state = (struct rip_accel_state){0};
+
+    LOG_INF("Set accel minimum to %u%%%s", accel, write_mode_label(mode));
+
+    return commit_write(dev, mode);
+}
+
 int zmk_input_processor_runtime_reset(const struct device *dev) {
     if (!dev) {
         return -EINVAL;
@@ -1722,6 +1816,8 @@ void zmk_input_processor_runtime_restore_persistent(const struct device *dev) {
     data->tilt_degrees = data->persistent_tilt_degrees;
     data->tilt_axis_degrees = data->persistent_tilt_axis_degrees;
     update_rotation_values(data);
+    data->accel_min_percent = data->persistent_accel_min_percent;
+    data->accel_state = (struct rip_accel_state){0};
 
     // Restore axis snap settings
     data->axis_snap_mode = data->persistent_axis_snap_mode;
@@ -1771,6 +1867,7 @@ int zmk_input_processor_runtime_get_config(const struct device *dev, const char 
         config->rotation_degrees = data->persistent_rotation_degrees;
         config->tilt_degrees = data->persistent_tilt_degrees;
         config->tilt_axis_degrees = data->persistent_tilt_axis_degrees;
+        config->accel_min_percent = data->persistent_accel_min_percent;
         config->temp_layer_enabled = data->persistent_temp_layer_enabled;
         config->temp_layer_layer = data->persistent_temp_layer_layer;
         config->temp_layer_activation_delay_ms = data->persistent_temp_layer_activation_delay_ms;
@@ -1830,6 +1927,9 @@ int zmk_input_processor_runtime_get_config(const struct device *dev, const char 
         .initial_rotation_degrees = (int32_t)DT_INST_PROP_OR(n, rotation_degrees, 0),              \
         .initial_tilt_degrees = (int32_t)DT_INST_PROP_OR(n, tilt_degrees, 0),                      \
         .initial_tilt_axis_degrees = (int32_t)DT_INST_PROP_OR(n, tilt_axis_degrees, 0),            \
+        .initial_accel_min_percent = (int32_t)DT_INST_PROP_OR(n, accel_min_percent, 100),          \
+        .accel_speed_low = DT_INST_PROP_OR(n, accel_speed_low, 20),                                \
+        .accel_speed_high = DT_INST_PROP_OR(n, accel_speed_high, 150),                             \
         .temp_layer_transparent_behavior = COND_CODE_1(                                            \
             DT_INST_NODE_HAS_PROP(n, temp_layer_transparent_behavior),                             \
             (DEVICE_DT_GET(DT_INST_PHANDLE(n, temp_layer_transparent_behavior))), (NULL)),         \
@@ -1984,12 +2084,13 @@ static int apply_persisted_settings_cb(const struct device *dev, void *user_data
         return 0;
     }
 
-    LOG_INF("Loaded settings for %s: scale=%d/%d, rotation=%d, tilt=%u@%d, "
+    LOG_INF("Loaded settings for %s: scale=%d/%d, rotation=%d, tilt=%u@%d, accel=%u%%, "
             "temp_layer=%d, active_layers=0x%08x, axis_snap=%d",
             cfg->name, data->persistent_scale_multiplier, data->persistent_scale_divisor,
             data->persistent_rotation_degrees, data->persistent_tilt_degrees,
-            data->persistent_tilt_axis_degrees, data->persistent_temp_layer_enabled,
-            data->persistent_active_layers, data->persistent_axis_snap_mode);
+            data->persistent_tilt_axis_degrees, data->persistent_accel_min_percent,
+            data->persistent_temp_layer_enabled, data->persistent_active_layers,
+            data->persistent_axis_snap_mode);
     return 0;
 }
 
@@ -2305,6 +2406,10 @@ static int runtime_processor_layer_state_changed_listener(const zmk_event_t *eh)
         if (data->inertia_active && !is_processor_active_for_current_layers(data->active_layers)) {
             LOG_DBG("Inertia stopped after active layer deactivation");
             inertia_stop(data, ZMK_INPUT_PROCESSOR_INERTIA_STOP_REASON_LAYER_INACTIVE);
+        }
+        if (data->accel_state.count != 0 &&
+            !is_processor_active_for_current_layers(data->active_layers)) {
+            data->accel_state = (struct rip_accel_state){0};
         }
     }
 

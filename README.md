@@ -9,6 +9,7 @@ This ZMK module provides runtime configurable input processors for pointing devi
 - **Scaling Support**: Configure speed multipliers (e.g., x2 faster, x0.5 slower)
 - **Rotation Support**: Apply rotation transformations in degrees (fully implemented with paired X/Y handling)
 - **Tilt Compensation**: Boost one (rotatable) axis by 1/cos(tilt) for trackballs rolled from a diagonal
+- **Pointer Acceleration**: Slow down slow movement for precise aiming while fast movement stays 1:1
 - **Axis Reversing**: Invert X and/or Y axis independently to reverse input direction
 - **Inertia**: Continue input after a rapid, configurable directional movement
 - **Axis Snapping**: Lock scrolling to X or Y axis with threshold-based unlock
@@ -544,6 +545,63 @@ firmware API is `zmk_input_processor_runtime_set_tilt()` /
 `zmk_input_processor_runtime_set_tilt_axis()`. The bundled web UI does not
 show tilt controls yet. The temporary-config behavior leaves tilt unchanged
 while held and restores the saved value on release.
+
+### Pointer Acceleration (precision at low speed)
+
+A speed-dependent gain: slow movement is scaled down so fine and diagonal
+aiming is easier, while fast movement keeps gain 1 (unchanged), so big moves
+cover the same distance as before.
+
+- `accel-min-percent` (default `100` = off): the gain, in percent, at or below
+  `accel-speed-low`. Clamped to `20..100` rather than rejected. At `100` the
+  processor skips acceleration entirely and its output is identical to having
+  no acceleration.
+- `accel-speed-low` (default `20`) and `accel-speed-high` (default `150`):
+  speeds in input counts per 100 ms. At or above `accel-speed-high` the gain
+  is 1. If `accel-speed-high` is not above `accel-speed-low`, the gain steps
+  from the minimum to 1 at `accel-speed-low`.
+
+```dts
+&my_rip {
+    accel-min-percent = <50>;  // half speed when moving slowly ...
+    accel-speed-low = <20>;    // ... up to 20 counts per 100 ms,
+    accel-speed-high = <150>;  // 1:1 from 150 counts per 100 ms
+};
+```
+
+**Curve.** The speed is `hypot(sum_x, sum_y) * 100 / window_ms`, where
+`sum_x` / `sum_y` are the signed X and Y input of the last `window_ms`
+(Kconfig `ZMK_RUNTIME_INPUT_PROCESSOR_ACCEL_WINDOW_MS`, default `40`; the
+processor keeps its last 32 X/Y events). Summing signed values first means
+back-and-forth jitter does not count as speed, and a diagonal counts its true
+length. With `t = clamp((speed - low) / (high - low), 0, 1)` the gain is
+`min + (1 - min) * (3t^2 - 2t^3)` (a smoothstep), computed in integer fixed
+point (permille, no floats). Each axis keeps a sub-count remainder between
+events, so slow 1-count movement is slowed down, never lost: at 50%, ten
+1-count steps give 5.
+
+| speed (counts / 100 ms) | 20 or less | 52   | 85   | 118  | 150 or more |
+| ----------------------- | ---------- | ---- | ---- | ---- | ----------- |
+| gain at `50`%           | 0.50       | 0.58 | 0.75 | 0.92 | 1.00        |
+
+The speed is measured and the gain applied after rotation, tilt
+compensation, axis inversion and axis snap, and before scaling, so the speeds
+are in sensor counts as they reach this processor (for a PMW3610 at 1200 CPI,
+20 counts per 100 ms is about 4 mm/s and 150 about 32 mm/s of ball surface).
+Inertia's raw speed measurement uses the input from before acceleration (its
+entry threshold stays in the final, scaled output). The speed history and
+remainders are cleared whenever the setting changes and when the processor
+becomes inactive for the current layers.
+
+The value follows the same write modes as the other settings (persist /
+memory / temporary) and is saved with them (settings blob version 5; records
+saved by older versions load with the devicetree default). Over Studio RPC it
+is `SetAccelRequest` and the `accel_min_percent` and `accel_supported` fields
+of `InputProcessorInfo`; the firmware API is
+`zmk_input_processor_runtime_set_accel()`. The speeds are devicetree only. The
+bundled web UI does not show acceleration controls yet. The temporary-config
+behavior leaves acceleration unchanged while held and restores the saved value
+on release.
 
 ## Development Guide
 

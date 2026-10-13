@@ -4,3 +4,4 @@ s/.*PASS: rip_inertia_decay_reverse_scroll/PASS: rip_inertia_decay_reverse_scrol
 s/.*PASS: rip_settings_write_modes/PASS: rip_settings_write_modes/p
 s/.*PASS: rip_inertia_latest_bucket_compensation/PASS: rip_inertia_latest_bucket_compensation/p
 s/.*PASS: rip_tilt_compensation/PASS: rip_tilt_compensation/p
+s/.*PASS: rip_pointer_accel/PASS: rip_pointer_accel/p

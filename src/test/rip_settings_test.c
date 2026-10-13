@@ -1181,6 +1181,148 @@ static int test_tilt(void) {
     return 0;
 }
 
+/* Pointer acceleration: clamping, slow input slowed with the remainder
+ * carried, fast input unchanged, 100 as the identity, v5 persistence and the
+ * v4 upgrade. Uses the devicetree speeds (20 / 150 counts per 100 ms) and the
+ * 40 ms default window; no time passes during this SYS_INIT test, so every
+ * event shares one timestamp and stays in the window. */
+static int test_accel(void) {
+    const struct device *dev = zmk_input_processor_runtime_find_by_name(TEST_PROCESSOR_NAME);
+    if (!dev) {
+        LOG_ERR("Test processor '%s' not found", TEST_PROCESSOR_NAME);
+        return -ENODEV;
+    }
+
+    struct zmk_input_processor_runtime_config cfg;
+    int ret;
+
+    /* Out-of-range requests are clamped, not rejected. */
+    static const struct {
+        uint32_t in;
+        uint8_t out;
+    } accel_cases[] = {{10, 20}, {150, 100}, {55, 55}};
+    for (size_t i = 0; i < ARRAY_SIZE(accel_cases); i++) {
+        ret = zmk_input_processor_runtime_set_accel(dev, accel_cases[i].in,
+                                                    ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_MEMORY);
+        if (ret < 0) {
+            return ret;
+        }
+        zmk_input_processor_runtime_get_config(dev, NULL, &cfg);
+        if (cfg.accel_min_percent != accel_cases[i].out) {
+            LOG_ERR("Accel %u: got %u expected %u", accel_cases[i].in, cfg.accel_min_percent,
+                    accel_cases[i].out);
+            return -EINVAL;
+        }
+    }
+
+    /* Isolate acceleration from rotation, tilt, scaling and inertia. */
+    if ((ret = zmk_input_processor_runtime_set_rotation(
+             dev, 0, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY)) < 0 ||
+        (ret = zmk_input_processor_runtime_set_tilt(
+             dev, 0, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY)) < 0 ||
+        (ret = zmk_input_processor_runtime_set_scaling(
+             dev, 1, 1, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY)) < 0 ||
+        (ret = zmk_input_processor_runtime_set_inertia_enabled(
+             dev, false, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY)) < 0) {
+        return ret;
+    }
+
+    /* 100 is off: events pass through untouched. */
+    int32_t x;
+    int32_t y;
+    if ((ret = zmk_input_processor_runtime_set_accel(
+             dev, 100, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY)) < 0 ||
+        (ret = process_test_relative(dev, INPUT_REL_X, 3, &x)) < 0 ||
+        (ret = process_test_relative(dev, INPUT_REL_Y, -5, &y)) < 0) {
+        return ret;
+    }
+    if (x != 3 || y != -5) {
+        LOG_ERR("Accel off changed events: %d %d expected 3 -5", x, y);
+        return -EINVAL;
+    }
+
+    /* 50%: eight slow 1-count steps (at most 20 counts per 100 ms) give 4;
+     * the carried remainder slows them down without losing any. Setting the
+     * value again clears the speed history, so Y starts slow too. */
+    int32_t total_x = 0;
+    int32_t total_y = 0;
+    if ((ret = zmk_input_processor_runtime_set_accel(
+             dev, 50, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY)) < 0 ||
+        (ret = process_test_single_axis_run(dev, INPUT_REL_X, 1, 8, &total_x)) < 0 ||
+        (ret = zmk_input_processor_runtime_set_accel(
+             dev, 50, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY)) < 0 ||
+        (ret = process_test_single_axis_run(dev, INPUT_REL_Y, -1, 8, &total_y)) < 0) {
+        return ret;
+    }
+    if (total_x != 4 || total_y != -4) {
+        LOG_ERR("Accel 50%% slow steps: got x=%d y=%d expected 4/-4", total_x, total_y);
+        return -EINVAL;
+    }
+
+    /* A fast report (100 counts in 40 ms, 250 per 100 ms) keeps gain 1. */
+    if ((ret = zmk_input_processor_runtime_set_accel(
+             dev, 50, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY)) < 0 ||
+        (ret = process_test_relative(dev, INPUT_REL_X, 100, &x)) < 0) {
+        return ret;
+    }
+    if (x != 100) {
+        LOG_ERR("Accel fast report: got %d expected 100", x);
+        return -EINVAL;
+    }
+    zmk_input_processor_runtime_restore_persistent(dev);
+
+    /* v5 persistence round trip. */
+    ret = zmk_input_processor_runtime_set_accel(dev, 60,
+                                                ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_PERSIST);
+    if (ret < 0) {
+        return ret;
+    }
+    zmk_input_processor_runtime_test_flush_save(dev);
+    zmk_input_processor_runtime_reset(dev);
+    zmk_input_processor_runtime_get_config(dev, NULL, &cfg);
+    if (cfg.accel_min_percent != 100) {
+        LOG_ERR("Reset did not restore the accel default: %u", cfg.accel_min_percent);
+        return -EINVAL;
+    }
+    ret = settings_load_subtree("custom_settings");
+    if (ret < 0) {
+        return ret;
+    }
+    zmk_input_processor_runtime_test_apply_persisted_settings();
+    zmk_input_processor_runtime_get_config(dev, NULL, &cfg);
+    if (cfg.accel_min_percent != 60) {
+        LOG_ERR("Persisted accel not restored: got %u expected 60", cfg.accel_min_percent);
+        return -EINVAL;
+    }
+
+    /* A memory-only change is dropped by discard. */
+    if ((ret = zmk_input_processor_runtime_set_accel(
+             dev, 30, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_MEMORY)) < 0 ||
+        (ret = zmk_input_processor_runtime_discard_all()) < 0) {
+        return ret;
+    }
+    zmk_input_processor_runtime_get_config(dev, NULL, &cfg);
+    if (cfg.accel_min_percent != 60) {
+        LOG_ERR("Accel discard did not restore flash value: got %u", cfg.accel_min_percent);
+        return -EINVAL;
+    }
+
+    /* A v4 record (no acceleration field) upgrades with the devicetree default. */
+    ret = zmk_input_processor_runtime_test_apply_legacy_v4(dev);
+    if (ret < 0) {
+        return ret;
+    }
+    zmk_input_processor_runtime_get_config(dev, NULL, &cfg);
+    if (cfg.rotation_degrees != 45 || cfg.accel_min_percent != 100) {
+        LOG_ERR("Legacy v4 settings were not migrated: rot=%d accel=%u", cfg.rotation_degrees,
+                cfg.accel_min_percent);
+        return -EINVAL;
+    }
+
+    LOG_INF("PASS: rip_pointer_accel");
+    return 0;
+}
+
 static int rip_settings_test_init(void) {
     int ret = test_settings_backend_init();
     if (ret < 0) {
@@ -1206,6 +1348,11 @@ static int rip_settings_test_init(void) {
     ret = test_tilt();
     if (ret < 0) {
         LOG_ERR("FAIL: rip_tilt_compensation ret=%d", ret);
+    }
+
+    ret = test_accel();
+    if (ret < 0) {
+        LOG_ERR("FAIL: rip_pointer_accel ret=%d", ret);
     }
     return 0;
 }

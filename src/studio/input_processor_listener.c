@@ -79,6 +79,8 @@ static int input_processor_state_changed_listener(const zmk_event_t *eh) {
     info->tilt_degrees = ev->config.tilt_degrees;
     info->tilt_axis_degrees = ev->config.tilt_axis_degrees;
     info->tilt_supported = true;
+    info->accel_min_percent = ev->config.accel_min_percent;
+    info->accel_supported = true;
     info->temp_layer_enabled = ev->config.temp_layer_enabled;
     info->temp_layer_layer = ev->config.temp_layer_layer;
     info->temp_layer_activation_delay_ms = ev->config.temp_layer_activation_delay_ms;

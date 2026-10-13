@@ -69,6 +69,31 @@ properties:
       report only the moving axis delay the cross terms until the other axis
       reports; prefer reporting both axes per motion report.
 
+  accel-min-percent:
+    type: int
+    default: 100
+    description: |
+      Initial pointer acceleration ("precision at low speed"): gain in percent
+      for input at or below accel-speed-low. Input at or above
+      accel-speed-high keeps gain 1, with a smoothstep curve in between.
+      Clamped to 20..100; 100 turns acceleration off (output unchanged).
+
+  accel-speed-low:
+    type: int
+    default: 20
+    description: |
+      Speed (input counts per 100 ms, measured after rotation, tilt, axis
+      inversion and axis snap, before scaling) at or below which the
+      accel-min-percent gain applies.
+
+  accel-speed-high:
+    type: int
+    default: 150
+    description: |
+      Speed (input counts per 100 ms) at or above which input is no longer
+      slowed down. If it is not above accel-speed-low, the gain steps from
+      accel-min-percent to 1 at accel-speed-low.
+
   track-remainders:
     type: boolean
     description: Track remainders for scaling operations (enabled if present)
