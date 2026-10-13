@@ -952,7 +952,10 @@ static int runtime_processor_handle_event(const struct device *dev, struct input
                         decay_per_50ms = 1; // Minimum decay of 1
                     }
 
-                    int16_t total_decay = decay_per_50ms * decay_periods;
+                    // Capped instead of truncated to int16: after a long pause (about 18 s
+                    // at 90 per period) the product wrapped to a small or negative decay
+                    // and left the cross axis unlocked.
+                    int total_decay = (int)MIN(decay_per_50ms * decay_periods, INT16_MAX);
 
                     // Decay towards zero
                     if (data->axis_snap_cross_axis_accum > 0) {
