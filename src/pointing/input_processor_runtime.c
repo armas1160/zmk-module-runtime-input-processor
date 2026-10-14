@@ -990,11 +990,14 @@ static void aim_handle_event(const struct runtime_processor_config *cfg,
  * that a processor earlier in the listener already turned into scroll on a
  * layer reached from the temp layer. With temp-layer-extend-on-other-input it
  * still counts as use, so the temp layer does not time out underneath (and
- * its keys are still there when scrolling ends). It never activates the layer. */
+ * its keys are still there when scrolling ends). It never activates the layer.
+ * Zero values count too: a scroll processor scaling 1/180 turns most motion
+ * into 0 with the rest carried, so slow scrolling would otherwise not count. */
 static void temp_layer_extend_on_other_input(const struct runtime_processor_config *cfg,
                                              struct runtime_processor_data *data,
                                              const struct input_event *event) {
-    if (!cfg->temp_layer_extend_on_other_input || event->value == 0 ||
+    ARG_UNUSED(event);
+    if (!cfg->temp_layer_extend_on_other_input ||
         !data->temp_layer_enabled || !data->temp_layer_layer_active ||
         data->temp_layer_keep_active || data->aim_hold_count > 0) {
         return;
