@@ -32,6 +32,7 @@
 #include <zmk/keys.h>
 
 #include "rip_accel_math.h"
+#include "rip_aim_math.h"
 #include "rip_tilt_math.h"
 
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
@@ -53,6 +54,12 @@ struct runtime_processor_config {
     int32_t initial_accel_min_percent;
     uint32_t accel_speed_low;
     uint32_t accel_speed_high;
+    // Aim mode from DT, used while an aim behavior is held (see rip_aim_math.h).
+    // The percent is kept raw and clamped where it is used.
+    int32_t aim_scale_percent;
+    uint32_t aim_smoothing_ms;
+    // Input dropped after a mouse button press or release (0 = off)
+    uint32_t click_freeze_ms;
     // Temp-layer behavior references for efficient comparison
     const struct device *temp_layer_transparent_behavior;
     const struct device *temp_layer_kp_behavior;
@@ -91,6 +98,10 @@ struct runtime_processor_config {
 
 /* Pointer acceleration speed window (see rip_accel_math.h). */
 #define ACCEL_WINDOW_MS CONFIG_ZMK_RUNTIME_INPUT_PROCESSOR_ACCEL_WINDOW_MS
+
+/* Aim mode: how often what the filter holds back is released once input
+ * stops (see rip_aim_math.h). */
+#define AIM_INTERVAL_MS CONFIG_ZMK_RUNTIME_INPUT_PROCESSOR_AIM_INTERVAL_MS
 
 BUILD_ASSERT(INERTIA_BUCKETS >= INERTIA_WINDOW_SLICES + 2,
              "Inertia bucket count must exceed window slices by at least two");
@@ -142,6 +153,18 @@ struct runtime_processor_data {
     // Recent input for the acceleration speed estimate and per-axis
     // remainders (permille, see rip_accel_math.h)
     struct rip_accel_state accel_state;
+
+    // Aim mode: how many aim keys are held, the filter per output axis (X, Y)
+    // and the work that releases what is left once input stops. aim_lock
+    // guards aim_axis between the input thread and the work.
+    uint8_t aim_hold_count;
+    struct rip_aim_axis aim_axis[2];
+    struct k_spinlock aim_lock;
+    struct k_work_delayable aim_work;
+
+    // Input is dropped until this uptime after a mouse button changed
+    // (0 = not frozen). Only touched from the input thread.
+    int64_t click_freeze_until;
 
     // Temp-layer layer settings
     bool temp_layer_enabled;
@@ -280,7 +303,9 @@ static void temp_layer_deactivation_work_handler(struct k_work *work) {
     struct runtime_processor_data *data =
         CONTAINER_OF(dwork, struct runtime_processor_data, temp_layer_deactivation_work);
 
-    if (!data->temp_layer_layer_active || data->temp_layer_keep_active) {
+    // A held aim key keeps the layer; its release re-arms this work
+    if (!data->temp_layer_layer_active || data->temp_layer_keep_active ||
+        data->aim_hold_count > 0) {
         return;
     }
 
@@ -860,6 +885,105 @@ static void inertia_handle_physical_event(struct runtime_processor_data *data, u
     }
 }
 
+/* Aim output released by the work is already in final cursor coordinates, so
+ * like inertia it goes straight to the HID report (see inertia_emit). The work
+ * only steps an axis that has had no event for AIM_INTERVAL_MS, so with a
+ * sensor that reports both axes it stays out of the way while the ball moves.
+ * It can still land between a listener's report and its send during a pause,
+ * which costs that one report of motion, as with inertia. */
+static void aim_emit(int16_t x, int16_t y) {
+#if IS_ENABLED(CONFIG_ZMK_POINTING)
+    zmk_hid_mouse_movement_set(x, y);
+    int ret = zmk_endpoint_send_mouse_report();
+    if (ret < 0) {
+        LOG_WRN("Aim report failed: %d", ret);
+    }
+    zmk_hid_mouse_movement_set(0, 0);
+#else
+    ARG_UNUSED(x);
+    ARG_UNUSED(y);
+#endif
+}
+
+/* Call with aim_lock held. */
+static bool aim_busy(const struct runtime_processor_data *data) {
+    return !rip_aim_idle(&data->aim_axis[0]) || !rip_aim_idle(&data->aim_axis[1]);
+}
+
+static void aim_work_handler(struct k_work *work) {
+    struct k_work_delayable *dwork = k_work_delayable_from_work(work);
+    struct runtime_processor_data *data =
+        CONTAINER_OF(dwork, struct runtime_processor_data, aim_work);
+    const struct runtime_processor_config *cfg = data->dev->config;
+
+    k_spinlock_key_t key = k_spin_lock(&data->aim_lock);
+    uint32_t now = (uint32_t)k_uptime_get();
+    int16_t out[2] = {0, 0};
+    for (int i = 0; i < 2; i++) {
+        // An axis still getting events releases there; step only quiet ones
+        struct rip_aim_axis *state = &data->aim_axis[i];
+        if (!rip_aim_idle(state) && now - state->last_ms >= AIM_INTERVAL_MS) {
+            out[i] = rip_aim_tick(state, now, cfg->aim_smoothing_ms);
+        }
+    }
+    int16_t x = out[0];
+    int16_t y = out[1];
+    bool busy = aim_busy(data);
+    if (!busy && data->aim_hold_count == 0) {
+        // Done after release: a fraction below one count is not worth a late move
+        data->aim_axis[0].frac = 0;
+        data->aim_axis[1].frac = 0;
+    }
+    k_spin_unlock(&data->aim_lock, key);
+
+    if (x != 0 || y != 0) {
+        aim_emit(x, y);
+    }
+    if (busy) {
+        k_work_reschedule(&data->aim_work, K_MSEC(AIM_INTERVAL_MS));
+    }
+}
+
+/* Aim mode on one cursor event, after scaling (see rip_aim_math.h). While an
+ * aim key is held the event is slowed down and filtered. After release, what
+ * the filter still holds is added to the passing events until it is gone.
+ * The work runs every AIM_INTERVAL_MS while anything is held back and
+ * releases it on the axes that have gone quiet. */
+static void aim_handle_event(const struct runtime_processor_config *cfg,
+                             struct runtime_processor_data *data, struct input_event *event) {
+    int axis = event->code == INPUT_REL_X ? 0 : (event->code == INPUT_REL_Y ? 1 : -1);
+    if (event->type != INPUT_EV_REL || axis < 0) {
+        return;
+    }
+
+    k_spinlock_key_t key = k_spin_lock(&data->aim_lock);
+    struct rip_aim_axis *state = &data->aim_axis[axis];
+    if (data->aim_hold_count == 0 && rip_aim_idle(state)) {
+        k_spin_unlock(&data->aim_lock, key);
+        return;
+    }
+
+    uint32_t now = (uint32_t)k_uptime_get();
+    int16_t value = (int16_t)CLAMP(event->value, INT16_MIN, INT16_MAX);
+    if (data->aim_hold_count > 0) {
+        event->value = rip_aim_apply_event(state, value, now, cfg->aim_scale_percent,
+                                           cfg->aim_smoothing_ms);
+    } else {
+        int32_t sum = (int32_t)value + rip_aim_tick(state, now, cfg->aim_smoothing_ms);
+        event->value = CLAMP(sum, INT16_MIN, INT16_MAX);
+        if (rip_aim_idle(state)) {
+            state->frac = 0;
+        }
+    }
+    bool busy = aim_busy(data);
+    k_spin_unlock(&data->aim_lock, key);
+
+    if (busy) {
+        // Keeps an already scheduled run: it must not be pushed back forever
+        k_work_schedule(&data->aim_work, K_MSEC(AIM_INTERVAL_MS));
+    }
+}
+
 static int runtime_processor_handle_event(const struct device *dev, struct input_event *event,
                                           uint32_t param1, uint32_t param2,
                                           struct zmk_input_processor_state *state) {
@@ -886,6 +1010,17 @@ static int runtime_processor_handle_event(const struct device *dev, struct input
             data->accel_state = (struct rip_accel_state){0};
         }
         return ZMK_INPUT_PROC_CONTINUE;
+    }
+
+    // Drop input for a moment after a mouse button press or release, so a
+    // thumb that shifts while a finger clicks does not move the cursor off
+    // its target (see click_freeze_handle_button).
+    if (data->click_freeze_until != 0) {
+        if (k_uptime_get() < data->click_freeze_until) {
+            event->value = 0;
+            return ZMK_INPUT_PROC_CONTINUE;
+        }
+        data->click_freeze_until = 0;
     }
 
     bool is_x = (x_idx >= 0);
@@ -1061,11 +1196,19 @@ static int runtime_processor_handle_event(const struct device *dev, struct input
         value = event->value;
     }
 
-    inertia_handle_physical_event(data, is_x ? 0 : 1, event, inertia_raw_value);
+    // No inertia while aiming: it would measure the speed before the slowdown
+    // and glide past the target (aim press also stops a running glide)
+    if (data->aim_hold_count == 0) {
+        inertia_handle_physical_event(data, is_x ? 0 : 1, event, inertia_raw_value);
+    }
 
-    // Schedule deactivation after input stops
+    // Aim mode (slowed and smoothed while an aim key is held) on the final
+    // cursor values
+    aim_handle_event(cfg, data, event);
+
+    // Schedule deactivation after input stops (held aim keeps the layer)
     if (data->temp_layer_enabled && data->temp_layer_layer_active &&
-        !data->temp_layer_keep_active) {
+        !data->temp_layer_keep_active && data->aim_hold_count == 0) {
         k_work_reschedule(&data->temp_layer_deactivation_work,
                           K_MSEC(data->temp_layer_deactivation_delay_ms));
     }
@@ -1526,6 +1669,13 @@ static int runtime_processor_init(const struct device *dev) {
                           temp_layer_deactivation_work_handler);
     k_work_init_delayable(&data->inertia_work, inertia_work_handler);
 
+    // Aim mode and click freeze start idle
+    data->aim_hold_count = 0;
+    data->aim_axis[0] = (struct rip_aim_axis){0};
+    data->aim_axis[1] = (struct rip_aim_axis){0};
+    data->click_freeze_until = 0;
+    k_work_init_delayable(&data->aim_work, aim_work_handler);
+
     LOG_INF("Runtime processor '%s' initialized", cfg->name);
 
     return 0;
@@ -1930,6 +2080,9 @@ int zmk_input_processor_runtime_get_config(const struct device *dev, const char 
         .initial_accel_min_percent = (int32_t)DT_INST_PROP_OR(n, accel_min_percent, 100),          \
         .accel_speed_low = DT_INST_PROP_OR(n, accel_speed_low, 20),                                \
         .accel_speed_high = DT_INST_PROP_OR(n, accel_speed_high, 150),                             \
+        .aim_scale_percent = (int32_t)DT_INST_PROP_OR(n, aim_scale_percent, 40),                   \
+        .aim_smoothing_ms = DT_INST_PROP_OR(n, aim_smoothing_ms, 50),                              \
+        .click_freeze_ms = DT_INST_PROP_OR(n, click_freeze_ms, 0),                                 \
         .temp_layer_transparent_behavior = COND_CODE_1(                                            \
             DT_INST_NODE_HAS_PROP(n, temp_layer_transparent_behavior),                             \
             (DEVICE_DT_GET(DT_INST_PHANDLE(n, temp_layer_transparent_behavior))), (NULL)),         \
@@ -2419,6 +2572,59 @@ static int runtime_processor_layer_state_changed_listener(const zmk_event_t *eh)
 ZMK_LISTENER(runtime_processor_layer_listener, runtime_processor_layer_state_changed_listener);
 ZMK_SUBSCRIPTION(runtime_processor_layer_listener, zmk_layer_state_changed);
 
+#if IS_ENABLED(CONFIG_ZMK_BEHAVIOR_MOUSE_KEY_PRESS) &&                                             \
+    (!IS_ENABLED(CONFIG_ZMK_SPLIT) || IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL))
+/*
+ * Mouse button presses and releases: &mkp reports them as key events on its
+ * own input device. Whatever aim still holds back is forgotten, so the cursor
+ * does not drift on after the click. Processors with click-freeze-ms also
+ * drop input for that long and stop a running inertia glide, so the cursor
+ * stays where the click landed. Runs on the input thread, like
+ * runtime_processor_handle_event.
+ */
+static void click_freeze_handle_button(const struct input_event *evt) {
+    if (evt->type != INPUT_EV_KEY) {
+        return;
+    }
+
+    int64_t now = k_uptime_get();
+    for (size_t i = 0; i < runtime_processors_count; i++) {
+        const struct device *dev = runtime_processors[i];
+        const struct runtime_processor_config *cfg = dev->config;
+        struct runtime_processor_data *data = dev->data;
+
+        k_spinlock_key_t key = k_spin_lock(&data->aim_lock);
+        bool had_aim = aim_busy(data);
+        data->aim_axis[0] = (struct rip_aim_axis){0};
+        data->aim_axis[1] = (struct rip_aim_axis){0};
+        k_spin_unlock(&data->aim_lock, key);
+        if (had_aim) {
+            k_work_cancel_delayable(&data->aim_work);
+        }
+
+        if (cfg->click_freeze_ms == 0) {
+            continue;
+        }
+        data->click_freeze_until = now + cfg->click_freeze_ms;
+        if (data->inertia_active) {
+            inertia_stop(data, ZMK_INPUT_PROCESSOR_INERTIA_STOP_REASON_UNSPECIFIED);
+        }
+
+        LOG_DBG("Button %u %s: '%s' frozen for %u ms", evt->code, evt->value ? "down" : "up",
+                cfg->name, cfg->click_freeze_ms);
+    }
+}
+
+#define CLICK_FREEZE_CALLBACK(node_id)                                                             \
+    static void click_freeze_cb_##node_id(struct input_event *evt, void *user_data) {              \
+        ARG_UNUSED(user_data);                                                                     \
+        click_freeze_handle_button(evt);                                                           \
+    }                                                                                              \
+    INPUT_CALLBACK_DEFINE(DEVICE_DT_GET(node_id), click_freeze_cb_##node_id, NULL);
+
+DT_FOREACH_STATUS_OKAY(zmk_behavior_mouse_key_press, CLICK_FREEZE_CALLBACK)
+#endif
+
 // Temp-layer layer configuration API
 int zmk_input_processor_runtime_set_temp_layer(const struct device *dev, bool enabled,
                                                uint8_t layer, uint32_t activation_delay_ms,
@@ -2849,6 +3055,50 @@ void zmk_input_processor_runtime_temp_layer_keep_active(const struct device *dev
     // immediately
     if (!keep_active && data->temp_layer_enabled && data->temp_layer_layer_active) {
         k_work_reschedule(&data->temp_layer_deactivation_work, K_NO_WAIT);
+    }
+}
+
+void zmk_input_processor_runtime_aim(const struct device *dev, bool hold) {
+    if (!dev) {
+        return;
+    }
+
+    struct runtime_processor_data *data = dev->data;
+
+    k_spinlock_key_t key = k_spin_lock(&data->aim_lock);
+    if (hold) {
+        if (data->aim_hold_count < UINT8_MAX) {
+            data->aim_hold_count++;
+        }
+    } else if (data->aim_hold_count > 0) {
+        data->aim_hold_count--;
+    }
+    uint8_t count = data->aim_hold_count;
+    bool busy = aim_busy(data);
+    k_spin_unlock(&data->aim_lock, key);
+
+    LOG_DBG("Aim %s, held by %u", hold ? "pressed" : "released", count);
+
+    // A glide that is still running would carry the cursor past the target
+    if (hold && data->inertia_active) {
+        inertia_stop(data, ZMK_INPUT_PROCESSOR_INERTIA_STOP_REASON_UNSPECIFIED);
+    }
+
+    // Aiming often pauses longer than the temp-layer timeout: keep the layer
+    // (and the clicks on it) while held, and time out as usual after release.
+    if (data->temp_layer_enabled && data->temp_layer_layer_active &&
+        !data->temp_layer_keep_active) {
+        if (count > 0) {
+            k_work_cancel_delayable(&data->temp_layer_deactivation_work);
+        } else {
+            k_work_reschedule(&data->temp_layer_deactivation_work,
+                              K_MSEC(data->temp_layer_deactivation_delay_ms));
+        }
+    }
+
+    // What the filter still holds is released after the last key goes up
+    if (count == 0 && busy) {
+        k_work_schedule(&data->aim_work, K_MSEC(AIM_INTERVAL_MS));
     }
 }
 

@@ -36,6 +36,15 @@ config ZMK_RUNTIME_INPUT_PROCESSOR_ACCEL_WINDOW_MS
       input of this window. Each processor keeps its last 32 X/Y events, so
       a long window with a fast report rate only sees the newest 32.
 
+config ZMK_RUNTIME_INPUT_PROCESSOR_AIM_INTERVAL_MS
+    int "Aim mode release interval in milliseconds"
+    range 4 100
+    default 15
+    help
+      Aim mode's smoothing holds part of the motion back. Once input pauses
+      this long, the rest is sent in reports this far apart until none is
+      left. Close to the Bluetooth connection interval avoids queueing.
+
 config ZMK_RUNTIME_INPUT_PROCESSOR_STUDIO_RPC
     bool "Enable runtime input processor custom Studio RPC"
     depends on ZMK_STUDIO

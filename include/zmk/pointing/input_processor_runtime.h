@@ -319,6 +319,18 @@ int zmk_input_processor_runtime_set_active_layers(const struct device *dev, uint
 void zmk_input_processor_runtime_temp_layer_keep_active(const struct device *dev, bool keep_active);
 
 /**
+ * @brief Hold or release aim mode (called by the aim behavior)
+ *
+ * While held by at least one key, cursor output is slowed to aim-scale-percent
+ * and low-pass filtered with aim-smoothing-ms, and the temp-layer layer stays
+ * active. Each hold must be matched by one release.
+ *
+ * @param dev Pointer to the device structure
+ * @param hold true on key press, false on key release
+ */
+void zmk_input_processor_runtime_aim(const struct device *dev, bool hold);
+
+/**
  * @brief Set axis snap mode
  *
  * @param dev Pointer to the device structure

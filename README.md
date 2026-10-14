@@ -603,6 +603,57 @@ bundled web UI does not show acceleration controls yet. The temporary-config
 behavior leaves acceleration unchanged while held and restores the saved value
 on release.
 
+### Aim Mode (precise aiming while a key is held)
+
+While a key bound to the aim behavior is held, the processor's cursor output
+is slowed down and smoothed, so a trembling thumb does not shake the cursor.
+The temp-layer layer also stays active while it is held, so its clicks are
+still there after a long pause.
+
+- `aim-scale-percent` (default `40`): speed while held, in percent of the
+  normal output. Clamped to `10..100`.
+- `aim-smoothing-ms` (default `50`): time constant of a first-order low-pass
+  filter on the output. The cursor trails the thumb by about this long, and
+  back-and-forth faster than about `1 / (2 pi tau)` (3 Hz at 50 ms) is damped:
+  a 10 Hz tremor to about a third. `0` turns the smoothing off.
+
+```dts
+#include <behaviors/runtime-input-processor.dtsi>  // provides &rip_aim
+
+&my_rip {
+    aim-scale-percent = <40>;
+    aim-smoothing-ms = <50>;
+};
+
+// keymap: &rip_aim on a key of the mouse layer
+```
+
+The filter runs on the final cursor values (after scaling and acceleration),
+per output axis, in integer fixed point (`src/pointing/rip_aim_math.h`).
+Nothing is lost: what it holds back is released when input pauses, every
+Kconfig `ZMK_RUNTIME_INPUT_PROCESSOR_AIM_INTERVAL_MS` (default `15`) until
+none is left, and after the key is released it is added to the passing
+events. Each axis carries its sub-count rest, so a filtered back-and-forth
+under 2 counts peak to peak leaves the cursor still. The settings are
+devicetree only and not persisted; the firmware API is
+`zmk_input_processor_runtime_aim()`.
+
+### Click Freeze
+
+`click-freeze-ms` (default `0` = off) drops the processor's input for that
+long after any mouse button (`&mkp`) is pressed or released and stops a
+running inertia glide, so a thumb that moves with the click does not pull the
+cursor off its target. A drag starts that much later. Independently of this
+setting, a button press or release forgets what aim mode still holds back, so
+the cursor does not drift on after a click. Inertia is not measured while an
+aim key is held, and pressing one stops a running glide.
+
+```dts
+&my_rip {
+    click-freeze-ms = <100>;
+};
+```
+
 ## Development Guide
 
 ### Setup

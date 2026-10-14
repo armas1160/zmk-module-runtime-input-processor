@@ -1,0 +1,19 @@
+# Copyright (c) 2026 The ZMK Contributors
+# SPDX-License-Identifier: MIT
+
+description: |
+  Behavior for precise aiming while a key is held: the processor's cursor
+  output is slowed to its aim-scale-percent and smoothed over its
+  aim-smoothing-ms, so a trembling thumb does not shake the cursor. The
+  temp-layer layer stays active while the key is held.
+
+compatible: "zmk,behavior-input-processor-aim"
+
+include: zero_param.yaml
+
+
+properties:
+  processor-name:
+    type: string
+    required: true
+    description: Name of the runtime input processor that moves the cursor

@@ -94,6 +94,31 @@ properties:
       slowed down. If it is not above accel-speed-low, the gain steps from
       accel-min-percent to 1 at accel-speed-low.
 
+  aim-scale-percent:
+    type: int
+    default: 40
+    description: |
+      Speed in percent of the normal output while an aim behavior
+      (zmk,behavior-input-processor-aim) is held. Clamped to 10..100.
+
+  aim-smoothing-ms:
+    type: int
+    default: 50
+    description: |
+      Time constant of the low-pass filter applied while an aim behavior is
+      held. The cursor trails the thumb by about this long, and back-and-forth
+      faster than about 1 / (2 pi aim-smoothing-ms) is damped: at 50 ms a
+      10 Hz tremor is cut to about a third. 0 turns the smoothing off.
+
+  click-freeze-ms:
+    type: int
+    default: 0
+    description: |
+      Drop this processor's input for this long after a mouse button (&mkp)
+      is pressed or released, and forget what aim mode still holds back, so
+      a thumb that moves with the click does not pull the cursor off its
+      target. 0 turns it off.
+
   track-remainders:
     type: boolean
     description: Track remainders for scaling operations (enabled if present)
