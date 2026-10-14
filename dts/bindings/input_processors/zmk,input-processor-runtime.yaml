@@ -160,6 +160,15 @@ properties:
     default: 500
     description: Default delay before deactivating temp-layer layer after input stops (milliseconds)
 
+  temp-layer-extend-on-other-input:
+    type: boolean
+    description: |
+      Input of this processor's type that it does not handle (for example
+      motion an earlier processor in the listener already turned into scroll
+      on a layer reached from the temp layer) also restarts the deactivation
+      delay, so the temp layer stays active while scrolling. It never
+      activates the layer.
+
   active-layers:
     type: int
     default: 0

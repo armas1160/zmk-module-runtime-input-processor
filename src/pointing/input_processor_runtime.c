@@ -67,6 +67,8 @@ struct runtime_processor_config {
     const uint16_t *temp_layer_keep_keycodes;
     // Temp-layer default settings from DT
     bool initial_temp_layer_enabled;
+    // Input this processor does not handle still delays temp-layer deactivation
+    bool temp_layer_extend_on_other_input;
     uint8_t initial_temp_layer_layer;
     uint16_t initial_temp_layer_activation_delay_ms;
     uint16_t initial_temp_layer_deactivation_delay_ms;
@@ -984,6 +986,23 @@ static void aim_handle_event(const struct runtime_processor_config *cfg,
     }
 }
 
+/* Input of this processor's type that it does not handle, typically motion
+ * that a processor earlier in the listener already turned into scroll on a
+ * layer reached from the temp layer. With temp-layer-extend-on-other-input it
+ * still counts as use, so the temp layer does not time out underneath (and
+ * its keys are still there when scrolling ends). It never activates the layer. */
+static void temp_layer_extend_on_other_input(const struct runtime_processor_config *cfg,
+                                             struct runtime_processor_data *data,
+                                             const struct input_event *event) {
+    if (!cfg->temp_layer_extend_on_other_input || event->value == 0 ||
+        !data->temp_layer_enabled || !data->temp_layer_layer_active ||
+        data->temp_layer_keep_active || data->aim_hold_count > 0) {
+        return;
+    }
+    k_work_reschedule(&data->temp_layer_deactivation_work,
+                      K_MSEC(data->temp_layer_deactivation_delay_ms));
+}
+
 static int runtime_processor_handle_event(const struct device *dev, struct input_event *event,
                                           uint32_t param1, uint32_t param2,
                                           struct zmk_input_processor_state *state) {
@@ -998,6 +1017,7 @@ static int runtime_processor_handle_event(const struct device *dev, struct input
     int y_idx = code_idx(event->code, cfg->y_codes, cfg->y_codes_len);
 
     if (x_idx < 0 && y_idx < 0) {
+        temp_layer_extend_on_other_input(cfg, data, event);
         return ZMK_INPUT_PROC_CONTINUE;
     }
 
@@ -2096,6 +2116,7 @@ int zmk_input_processor_runtime_get_config(const struct device *dev, const char 
             COND_CODE_1(DT_INST_NODE_HAS_PROP(n, temp_layer_keep_keycodes),                        \
                         (runtime_temp_layer_keep_keycodes_##n), (NULL)),                           \
         .initial_temp_layer_enabled = DT_INST_PROP(n, temp_layer_enabled),                         \
+        .temp_layer_extend_on_other_input = DT_INST_PROP(n, temp_layer_extend_on_other_input),     \
         .initial_temp_layer_layer = DT_INST_PROP_OR(n, temp_layer, 0),                             \
         .initial_temp_layer_activation_delay_ms =                                                  \
             DT_INST_PROP_OR(n, temp_layer_activation_delay_ms, 100),                               \

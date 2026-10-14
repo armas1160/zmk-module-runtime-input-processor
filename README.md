@@ -325,6 +325,11 @@ Temp-layer layer settings can also be configured through the web interface:
 - When you press any keyboard key, the layer deactivates immediately (unless it's a modifier or the key is on the temp-layer layer)
 - If you stop moving the pointing device, the layer deactivates after the deactivation delay
 - If a key press occurs before the activation delay expires, the layer won't activate
+- With `temp-layer-extend-on-other-input`, input the processor does not handle
+  itself (such as motion that a scroll processor earlier in the same listener
+  already turned into scroll, on a scroll layer reached from the temp layer)
+  also restarts the deactivation delay, so the temp layer does not time out
+  while you scroll. It never activates the layer
 
 **Keep Temp-Layer Layer Active:**
 
