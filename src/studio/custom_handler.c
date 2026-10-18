@@ -15,6 +15,9 @@
 #include <zmk/pointing/input_processor_runtime.h>
 #include <zmk/studio/custom.h>
 #include <zmk/workqueue.h>
+#if IS_ENABLED(CONFIG_ZMK_CUSTOM_SETTINGS)
+#include <cormoran/zmk/custom_settings.h>
+#endif
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
 #if IS_ENABLED(CONFIG_ZMK_RUNTIME_INPUT_PROCESSOR)
@@ -143,6 +146,17 @@ static bool rip_rpc_handle_request(const zmk_custom_CallRequest *raw_request,
     }
 
     int rc = 0;
+#if IS_ENABLED(CONFIG_ZMK_CUSTOM_SETTINGS)
+    // Requests such as Save All write the custom-settings entries from inside
+    // this dispatch. This subsystem's own response and change notification
+    // already tell the client, so suppress custom-settings' "setting changed"
+    // notification meanwhile: it would compete with the in-flight response on
+    // the single Studio connection and can make a successful write time out.
+    // No-op unless CONFIG_ZMK_CUSTOM_SETTINGS_STUDIO_RPC is built. The counter
+    // is only safe on the Studio RPC thread, so the debounced save that runs
+    // later on the system work queue is not bracketed.
+    zmk_custom_settings_notify_suppress_begin();
+#endif
     switch (req.which_request_type) {
     case cormoran_rip_Request_list_input_processors_tag:
         rc = handle_list_input_processors(&req.request_type.list_input_processors, resp);
@@ -257,6 +271,9 @@ static bool rip_rpc_handle_request(const zmk_custom_CallRequest *raw_request,
         LOG_WRN("Unsupported rip request type: %d", req.which_request_type);
         rc = -1;
     }
+#if IS_ENABLED(CONFIG_ZMK_CUSTOM_SETTINGS)
+    zmk_custom_settings_notify_suppress_end();
+#endif
 
     if (rc != 0) {
         cormoran_rip_ErrorResponse err = cormoran_rip_ErrorResponse_init_zero;
