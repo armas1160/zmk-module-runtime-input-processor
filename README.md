@@ -599,8 +599,8 @@ remainders are cleared whenever the setting changes and when the processor
 becomes inactive for the current layers.
 
 The value follows the same write modes as the other settings (persist /
-memory / temporary) and is saved with them (settings blob version 5; records
-saved by older versions load with the devicetree default). Over Studio RPC it
+memory / temporary) and is saved with them (since settings blob version 5;
+records saved by older versions load with the devicetree default). Over Studio RPC it
 is `SetAccelRequest` and the `accel_min_percent` and `accel_supported` fields
 of `InputProcessorInfo`; the firmware API is
 `zmk_input_processor_runtime_set_accel()`. The speeds are devicetree only. The
@@ -620,7 +620,8 @@ still there after a long pause.
 - `aim-smoothing-ms` (default `50`): time constant of a first-order low-pass
   filter on the output. The cursor trails the thumb by about this long, and
   back-and-forth faster than about `1 / (2 pi tau)` (3 Hz at 50 ms) is damped:
-  a 10 Hz tremor to about a third. `0` turns the smoothing off.
+  a 10 Hz tremor to about a third. `0` turns the smoothing off. Clamped to
+  `0..200`.
 
 ```dts
 #include <behaviors/runtime-input-processor.dtsi>  // provides &rip_aim
@@ -639,9 +640,20 @@ Nothing is lost: what it holds back is released when input pauses, every
 Kconfig `ZMK_RUNTIME_INPUT_PROCESSOR_AIM_INTERVAL_MS` (default `15`) until
 none is left, and after the key is released it is added to the passing
 events. Each axis carries its sub-count rest, so a filtered back-and-forth
-under 2 counts peak to peak leaves the cursor still. The settings are
-devicetree only and not persisted; the firmware API is
-`zmk_input_processor_runtime_aim()`.
+under 2 counts peak to peak leaves the cursor still. With `0` smoothing
+nothing is held back: each event comes out at once, only slowed down.
+
+Both values can be changed at runtime and follow the same write modes as the
+other settings (persist / memory / temporary); the devicetree values are the
+defaults and what reset restores. Out-of-range values are clamped (speed
+`10..100`, smoothing `0..200` ms). They are saved with the other settings
+(settings blob version 6; records saved by older versions keep their values
+and load the aim settings from the devicetree). Over Studio RPC it is
+`SetAimRequest` and the `aim_scale_percent`, `aim_smoothing_ms` and
+`aim_supported` fields of `InputProcessorInfo`; the firmware API is
+`zmk_input_processor_runtime_set_aim()`, and holding/releasing is
+`zmk_input_processor_runtime_aim()`. The temporary-config behavior leaves
+them unchanged while held and restores the saved values on release.
 
 ### Click Freeze
 

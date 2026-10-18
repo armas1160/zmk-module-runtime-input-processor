@@ -1323,6 +1323,169 @@ static int test_accel(void) {
     return 0;
 }
 
+static int check_aim_config(const struct device *dev, uint8_t scale, uint8_t smoothing,
+                            const char *what) {
+    struct zmk_input_processor_runtime_config cfg;
+    int ret = zmk_input_processor_runtime_get_config(dev, NULL, &cfg);
+    if (ret < 0) {
+        return ret;
+    }
+    if (cfg.aim_scale_percent != scale || cfg.aim_smoothing_ms != smoothing) {
+        LOG_ERR("%s: aim %u%%/%u ms expected %u%%/%u ms", what, cfg.aim_scale_percent,
+                cfg.aim_smoothing_ms, scale, smoothing);
+        return -EINVAL;
+    }
+    return 0;
+}
+
+/* Aim mode settings: clamping, smoothing 0 as no smoothing (only the
+ * slowdown), write modes, v6 persistence and the v5 upgrade. test.dtsi sets
+ * no aim properties, so the devicetree defaults are 40 % and 50 ms. No time
+ * passes during this SYS_INIT test, so the filter releases nothing on its
+ * own. */
+static int test_aim(void) {
+    const struct device *dev = zmk_input_processor_runtime_find_by_name(TEST_PROCESSOR_NAME);
+    if (!dev) {
+        LOG_ERR("Test processor '%s' not found", TEST_PROCESSOR_NAME);
+        return -ENODEV;
+    }
+
+    struct zmk_input_processor_runtime_config cfg;
+    int ret;
+
+    if ((ret = check_aim_config(dev, 40, 50, "Aim default")) < 0) {
+        return ret;
+    }
+
+    /* Out-of-range requests are clamped, not rejected. */
+    static const struct {
+        uint32_t scale_in;
+        uint32_t smoothing_in;
+        uint8_t scale_out;
+        uint8_t smoothing_out;
+    } aim_cases[] = {{5, 300, 10, 200}, {150, 0, 100, 0}, {55, 120, 55, 120}};
+    for (size_t i = 0; i < ARRAY_SIZE(aim_cases); i++) {
+        ret = zmk_input_processor_runtime_set_aim(dev, aim_cases[i].scale_in,
+                                                  aim_cases[i].smoothing_in,
+                                                  ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_MEMORY);
+        if (ret < 0) {
+            return ret;
+        }
+        if ((ret = check_aim_config(dev, aim_cases[i].scale_out, aim_cases[i].smoothing_out,
+                                    "Aim clamp")) < 0) {
+            return ret;
+        }
+    }
+
+    /* A temporary change leaves the saved value alone. */
+    if ((ret = zmk_input_processor_runtime_set_aim(
+             dev, 30, 0, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY)) < 0 ||
+        (ret = check_aim_config(dev, 55, 120, "Aim temporary")) < 0) {
+        return ret;
+    }
+
+    /* Isolate aim from rotation, tilt, scaling, acceleration and inertia. */
+    if ((ret = zmk_input_processor_runtime_set_rotation(
+             dev, 0, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY)) < 0 ||
+        (ret = zmk_input_processor_runtime_set_tilt(
+             dev, 0, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY)) < 0 ||
+        (ret = zmk_input_processor_runtime_set_scaling(
+             dev, 1, 1, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY)) < 0 ||
+        (ret = zmk_input_processor_runtime_set_accel(
+             dev, 100, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY)) < 0 ||
+        (ret = zmk_input_processor_runtime_set_inertia_enabled(
+             dev, false, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY)) < 0) {
+        return ret;
+    }
+
+    /* 50 % with smoothing 0: every event comes out at once at half speed,
+     * the sub-count rest carried (10, 3, 3 -> 5, 1, 2). */
+    int32_t out[4];
+    if ((ret = zmk_input_processor_runtime_set_aim(
+             dev, 50, 0, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY)) < 0) {
+        return ret;
+    }
+    zmk_input_processor_runtime_aim(dev, true);
+    if ((ret = process_test_relative(dev, INPUT_REL_X, 10, &out[0])) < 0 ||
+        (ret = process_test_relative(dev, INPUT_REL_X, 3, &out[1])) < 0 ||
+        (ret = process_test_relative(dev, INPUT_REL_X, 3, &out[2])) < 0 ||
+        (ret = process_test_relative(dev, INPUT_REL_Y, -4, &out[3])) < 0) {
+        zmk_input_processor_runtime_aim(dev, false);
+        return ret;
+    }
+    if (out[0] != 5 || out[1] != 1 || out[2] != 2 || out[3] != -2) {
+        LOG_ERR("Aim 50%% unsmoothed: got %d %d %d %d expected 5 1 2 -2", out[0], out[1], out[2],
+                out[3]);
+        zmk_input_processor_runtime_aim(dev, false);
+        return -EINVAL;
+    }
+
+    /* With smoothing, motion from rest is held back at first; turning the
+     * smoothing off releases it with the next event. */
+    if ((ret = zmk_input_processor_runtime_set_aim(
+             dev, 50, 50, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY)) < 0 ||
+        (ret = process_test_relative(dev, INPUT_REL_X, 10, &out[0])) < 0 ||
+        (ret = zmk_input_processor_runtime_set_aim(
+             dev, 50, 0, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY)) < 0 ||
+        (ret = process_test_relative(dev, INPUT_REL_X, 0, &out[1])) < 0) {
+        zmk_input_processor_runtime_aim(dev, false);
+        return ret;
+    }
+    zmk_input_processor_runtime_aim(dev, false);
+    if (out[0] != 0 || out[1] != 5) {
+        LOG_ERR("Aim smoothing switch: got %d then %d expected 0 then 5", out[0], out[1]);
+        return -EINVAL;
+    }
+    zmk_input_processor_runtime_restore_persistent(dev);
+
+    /* v6 persistence round trip; reset restores the devicetree defaults. */
+    ret = zmk_input_processor_runtime_set_aim(dev, 70, 120,
+                                              ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_PERSIST);
+    if (ret < 0) {
+        return ret;
+    }
+    zmk_input_processor_runtime_test_flush_save(dev);
+    zmk_input_processor_runtime_reset(dev);
+    if ((ret = check_aim_config(dev, 40, 50, "Aim reset")) < 0) {
+        return ret;
+    }
+    ret = settings_load_subtree("custom_settings");
+    if (ret < 0) {
+        return ret;
+    }
+    zmk_input_processor_runtime_test_apply_persisted_settings();
+    if ((ret = check_aim_config(dev, 70, 120, "Aim persisted")) < 0) {
+        return ret;
+    }
+
+    /* A memory-only change is dropped by discard. */
+    if ((ret = zmk_input_processor_runtime_set_aim(
+             dev, 20, 10, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_MEMORY)) < 0 ||
+        (ret = zmk_input_processor_runtime_discard_all()) < 0 ||
+        (ret = check_aim_config(dev, 70, 120, "Aim discard")) < 0) {
+        return ret;
+    }
+
+    /* A v5 record (no aim fields) keeps its own values and takes the
+     * devicetree aim defaults. */
+    if ((ret = zmk_input_processor_runtime_set_accel(
+             dev, 70, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_MEMORY)) < 0 ||
+        (ret = zmk_input_processor_runtime_test_apply_legacy_v5(dev)) < 0) {
+        return ret;
+    }
+    zmk_input_processor_runtime_get_config(dev, NULL, &cfg);
+    if (cfg.rotation_degrees != 46 || cfg.accel_min_percent != 70 || cfg.aim_scale_percent != 40 ||
+        cfg.aim_smoothing_ms != 50) {
+        LOG_ERR("Legacy v5 settings were not migrated: rot=%d accel=%u aim=%u%%/%u ms",
+                cfg.rotation_degrees, cfg.accel_min_percent, cfg.aim_scale_percent,
+                cfg.aim_smoothing_ms);
+        return -EINVAL;
+    }
+
+    LOG_INF("PASS: rip_aim_settings");
+    return 0;
+}
+
 static int rip_settings_test_init(void) {
     int ret = test_settings_backend_init();
     if (ret < 0) {
@@ -1353,6 +1516,11 @@ static int rip_settings_test_init(void) {
     ret = test_accel();
     if (ret < 0) {
         LOG_ERR("FAIL: rip_pointer_accel ret=%d", ret);
+    }
+
+    ret = test_aim();
+    if (ret < 0) {
+        LOG_ERR("FAIL: rip_aim_settings ret=%d", ret);
     }
     return 0;
 }

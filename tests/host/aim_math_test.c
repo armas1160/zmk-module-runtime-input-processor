@@ -58,6 +58,14 @@ static void test_clamp(void) {
     CHECK(rip_aim_clamp_percent(100) == 100, "clamp 100");
     CHECK(rip_aim_clamp_percent(256) == 100, "clamp 256 must not wrap");
     CHECK(rip_aim_clamp_percent(4294967295LL) == 100, "clamp UINT32_MAX");
+
+    CHECK(rip_aim_clamp_smoothing_ms(-1) == 0, "smoothing clamp -1");
+    CHECK(rip_aim_clamp_smoothing_ms(0) == 0, "smoothing clamp 0");
+    CHECK(rip_aim_clamp_smoothing_ms(50) == 50, "smoothing clamp 50");
+    CHECK(rip_aim_clamp_smoothing_ms(200) == 200, "smoothing clamp 200");
+    CHECK(rip_aim_clamp_smoothing_ms(201) == 200, "smoothing clamp 201");
+    CHECK(rip_aim_clamp_smoothing_ms(456) == 200, "smoothing clamp 456 must not wrap");
+    CHECK(rip_aim_clamp_smoothing_ms(4294967295LL) == 200, "smoothing clamp UINT32_MAX");
 }
 
 static void test_rest(void) {
@@ -89,6 +97,26 @@ static void test_passthrough(void) {
         }
     }
     CHECK(1, "identity");
+
+    /* tau 0 is no smoothing at all: each event is output at once, slowed
+     * only, with nothing left pending for the timer (no divide by zero). */
+    a = (struct rip_aim_axis){0};
+    now = 1000;
+    long in = 0;
+    long out_total = 0;
+    for (int v = -50; v <= 60; v += 3, now += 6) {
+        int16_t out = rip_aim_apply_event(&a, (int16_t)v, now, PERCENT, 0);
+        in += v;
+        out_total += out;
+        if (!rip_aim_idle(&a)) {
+            CHECK(0, "tau 0 left %d pending after %d", a.pending, v);
+            return;
+        }
+    }
+    long expected = in * PERCENT * 10;
+    long got = out_total * 1000 + a.frac;
+    CHECK(got == expected, "tau 0 output %ld milli expected %ld", got, expected);
+    CHECK(rip_aim_tick(&a, now + 100, 0) == 0 && rip_aim_idle(&a), "tau 0 tick after input");
 }
 
 /* Everything added comes out (in milli-counts, with the fraction in frac). */

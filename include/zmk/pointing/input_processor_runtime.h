@@ -43,6 +43,10 @@ struct zmk_input_processor_runtime_config {
     int16_t tilt_axis_degrees; // (-90, 90], clockwise from up/down (90 = left/right)
     // Pointer acceleration: gain at low speed in percent (20..100, 100 = off)
     uint8_t accel_min_percent;
+    // Aim mode while an aim key is held: speed in percent (10..100) and the
+    // smoothing time constant (0..200 ms, 0 = no smoothing)
+    uint8_t aim_scale_percent;
+    uint8_t aim_smoothing_ms;
     // Temp-layer layer settings
     bool temp_layer_enabled;
     uint8_t temp_layer_layer;
@@ -144,6 +148,24 @@ int zmk_input_processor_runtime_set_tilt_axis(const struct device *dev, int32_t 
  */
 int zmk_input_processor_runtime_set_accel(const struct device *dev, uint32_t percent,
                                           enum zmk_input_processor_runtime_write_mode mode);
+
+/**
+ * @brief Set aim mode: the speed and smoothing used while an aim key is held
+ *
+ * While an aim behavior is held, cursor output is multiplied by
+ * scale_percent / 100 and low-pass filtered with time constant smoothing_ms
+ * (see zmk_input_processor_runtime_aim). The devicetree aim-scale-percent and
+ * aim-smoothing-ms are the defaults and what reset restores.
+ *
+ * @param dev Pointer to the device structure
+ * @param scale_percent Speed while aiming in percent; clamped to 10..100
+ * @param smoothing_ms Smoothing time constant in ms; clamped to 0..200 (0 = no smoothing)
+ * @param mode Where to store the values (persist to flash, memory-only, or temporary)
+ * @return 0 on success, negative error code on failure
+ */
+int zmk_input_processor_runtime_set_aim(const struct device *dev, uint32_t scale_percent,
+                                        uint32_t smoothing_ms,
+                                        enum zmk_input_processor_runtime_write_mode mode);
 
 /**
  * @brief Reset processor to default values and save to persistent storage
@@ -321,8 +343,9 @@ void zmk_input_processor_runtime_temp_layer_keep_active(const struct device *dev
 /**
  * @brief Hold or release aim mode (called by the aim behavior)
  *
- * While held by at least one key, cursor output is slowed to aim-scale-percent
- * and low-pass filtered with aim-smoothing-ms, and the temp-layer layer stays
+ * While held by at least one key, cursor output is slowed to the aim scale
+ * and low-pass filtered with the aim smoothing (see
+ * zmk_input_processor_runtime_set_aim), and the temp-layer layer stays
  * active. Each hold must be matched by one release.
  *
  * @param dev Pointer to the device structure
@@ -517,6 +540,9 @@ int zmk_input_processor_runtime_test_apply_legacy_v3(const struct device *dev);
 
 /** @brief Test-only: apply a v4 blob (rotation 45) without the acceleration field. */
 int zmk_input_processor_runtime_test_apply_legacy_v4(const struct device *dev);
+
+/** @brief Test-only: apply a v5 blob (rotation 46) without the aim fields. */
+int zmk_input_processor_runtime_test_apply_legacy_v5(const struct device *dev);
 
 /** @brief Test-only: verify timed report splitting and rolling expiration. */
 int zmk_input_processor_runtime_test_inertia_sliding_window(void);

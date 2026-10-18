@@ -61,6 +61,10 @@ message InputProcessorInfo {
     // Pointer acceleration ("precision at low speed")
     uint32 accel_min_percent = 33;  // 20..100, gain at low speed; 100 = acceleration off
     bool accel_supported = 34;      // always true in this fork, so clients can detect support
+    // Aim mode (slow, smoothed cursor while an aim key is held)
+    uint32 aim_scale_percent = 35;  // 10..100, cursor speed while aiming
+    uint32 aim_smoothing_ms = 36;   // 0..200, smoothing time constant; 0 = off
+    bool aim_supported = 37;        // always true in this fork, so clients can detect support
 }
 
 message ListInputProcessorsRequest {
@@ -346,6 +350,15 @@ message SetAccelRequest {
 }
 message SetAccelResponse {}
 
+// Aim mode: out-of-range values are clamped, not rejected.
+message SetAimRequest {
+    uint32 id = 1;
+    uint32 scale_percent = 2;  // clamped to 10..100
+    uint32 smoothing_ms = 3;   // clamped to 0..200
+    WriteMode write_mode = 4;  // Where to store the values (default: persist)
+}
+message SetAimResponse {}
+
 // Persist every processor's current in-memory settings to flash. Flushes values
 // that were set with WRITE_MODE_MEMORY.
 message SaveAllSettingsRequest {
@@ -413,6 +426,7 @@ message Request {
         SetTiltRequest set_tilt = 34;
         SetTiltAxisRequest set_tilt_axis = 35;
         SetAccelRequest set_accel = 36;
+        SetAimRequest set_aim = 37;
     }
 }
 
@@ -456,6 +470,7 @@ message Response {
         SetTiltResponse set_tilt = 35;
         SetTiltAxisResponse set_tilt_axis = 36;
         SetAccelResponse set_accel = 37;
+        SetAimResponse set_aim = 38;
     }
 }
 

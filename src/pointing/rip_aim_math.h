@@ -40,6 +40,11 @@
 #define RIP_AIM_MIN_PERCENT 10
 #define RIP_AIM_MAX_PERCENT 100
 
+/* aim-smoothing-ms range. 0 releases everything at once (no smoothing, only
+ * the slowdown); the top keeps the cursor lag at a usable fraction of a
+ * second and the value in one byte. */
+#define RIP_AIM_MAX_SMOOTHING_MS 200
+
 #define RIP_AIM_MILLI 1000
 
 /* Pending at or below this many milli-counts is released whole. */
@@ -68,6 +73,17 @@ static inline uint8_t rip_aim_clamp_percent(int64_t percent) {
         return RIP_AIM_MAX_PERCENT;
     }
     return (uint8_t)percent;
+}
+
+/* Clamp a requested smoothing time constant to [0, RIP_AIM_MAX_SMOOTHING_MS]. */
+static inline uint8_t rip_aim_clamp_smoothing_ms(int64_t ms) {
+    if (ms < 0) {
+        return 0;
+    }
+    if (ms > RIP_AIM_MAX_SMOOTHING_MS) {
+        return RIP_AIM_MAX_SMOOTHING_MS;
+    }
+    return (uint8_t)ms;
 }
 
 static inline bool rip_aim_idle(const struct rip_aim_axis *axis) { return axis->pending == 0; }

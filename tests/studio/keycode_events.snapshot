@@ -5,3 +5,4 @@ PASS: rip_inertia_decay_reverse_scroll
 PASS: rip_settings_write_modes rot=43 legacy_v1_v2=ok
 PASS: rip_tilt_compensation
 PASS: rip_pointer_accel
+PASS: rip_aim_settings

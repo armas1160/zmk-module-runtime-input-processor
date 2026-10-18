@@ -64,6 +64,7 @@ static int handle_set_tilt(const cormoran_rip_SetTiltRequest *req, cormoran_rip_
 static int handle_set_tilt_axis(const cormoran_rip_SetTiltAxisRequest *req,
                                 cormoran_rip_Response *resp);
 static int handle_set_accel(const cormoran_rip_SetAccelRequest *req, cormoran_rip_Response *resp);
+static int handle_set_aim(const cormoran_rip_SetAimRequest *req, cormoran_rip_Response *resp);
 static int handle_reset_input_processor(const cormoran_rip_ResetInputProcessorRequest *req,
                                         cormoran_rip_Response *resp);
 static int handle_set_temp_layer_enabled(const cormoran_rip_SetTempLayerEnabledRequest *req,
@@ -166,6 +167,9 @@ static bool rip_rpc_handle_request(const zmk_custom_CallRequest *raw_request,
         break;
     case cormoran_rip_Request_set_accel_tag:
         rc = handle_set_accel(&req.request_type.set_accel, resp);
+        break;
+    case cormoran_rip_Request_set_aim_tag:
+        rc = handle_set_aim(&req.request_type.set_aim, resp);
         break;
     case cormoran_rip_Request_reset_input_processor_tag:
         rc = handle_reset_input_processor(&req.request_type.reset_input_processor, resp);
@@ -357,6 +361,9 @@ static int handle_get_input_processor(const cormoran_rip_GetInputProcessorReques
     result.processor.tilt_supported = true;
     result.processor.accel_min_percent = config.accel_min_percent;
     result.processor.accel_supported = true;
+    result.processor.aim_scale_percent = config.aim_scale_percent;
+    result.processor.aim_smoothing_ms = config.aim_smoothing_ms;
+    result.processor.aim_supported = true;
     result.processor.temp_layer_enabled = config.temp_layer_enabled;
     result.processor.temp_layer_layer = config.temp_layer_layer;
     result.processor.temp_layer_activation_delay_ms = config.temp_layer_activation_delay_ms;
@@ -566,6 +573,34 @@ static int handle_set_accel(const cormoran_rip_SetAccelRequest *req, cormoran_ri
     resp->which_response_type = cormoran_rip_Response_set_accel_tag;
     resp->response_type.set_accel =
         (cormoran_rip_SetAccelResponse)cormoran_rip_SetAccelResponse_init_zero;
+
+    return 0;
+}
+
+/**
+ * Handle setting aim mode (speed clamped to 10..100, smoothing to 0..200 ms)
+ */
+static int handle_set_aim(const cormoran_rip_SetAimRequest *req, cormoran_rip_Response *resp) {
+    LOG_DBG("Setting aim for id=%d to %u%%, %u ms", req->id, req->scale_percent, req->smoothing_ms);
+
+    const struct device *dev = zmk_input_processor_runtime_find_by_id(req->id);
+    if (!dev) {
+        LOG_WRN("Input processor not found: id=%d", req->id);
+        return -ENODEV;
+    }
+
+    // Set aim mode (write mode per request)
+    int ret = zmk_input_processor_runtime_set_aim(dev, req->scale_percent, req->smoothing_ms,
+                                                  rip_write_mode(req->write_mode));
+    if (ret < 0) {
+        LOG_ERR("Failed to set aim: %d", ret);
+        return ret;
+    }
+
+    // Return empty response
+    resp->which_response_type = cormoran_rip_Response_set_aim_tag;
+    resp->response_type.set_aim =
+        (cormoran_rip_SetAimResponse)cormoran_rip_SetAimResponse_init_zero;
 
     return 0;
 }

@@ -98,8 +98,9 @@ properties:
     type: int
     default: 40
     description: |
-      Speed in percent of the normal output while an aim behavior
+      Initial speed in percent of the normal output while an aim behavior
       (zmk,behavior-input-processor-aim) is held. Clamped to 10..100.
+      Runtime-settable (SetAimRequest) and persisted; this is the default.
 
   aim-smoothing-ms:
     type: int
@@ -109,6 +110,8 @@ properties:
       held. The cursor trails the thumb by about this long, and back-and-forth
       faster than about 1 / (2 pi aim-smoothing-ms) is damped: at 50 ms a
       10 Hz tremor is cut to about a third. 0 turns the smoothing off.
+      Clamped to 0..200. Runtime-settable (SetAimRequest) and persisted;
+      this is the default.
 
   click-freeze-ms:
     type: int
