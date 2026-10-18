@@ -113,6 +113,18 @@ properties:
       Clamped to 0..200. Runtime-settable (SetAimRequest) and persisted;
       this is the default.
 
+  smoothing-ms:
+    type: int
+    default: 0
+    description: |
+      Initial normal smoothing: the aim filter (a first-order low-pass with
+      this time constant) at full speed while no aim behavior is held. The
+      cursor trails the ball by about this long and what is held back is
+      released once input stops. 0 turns it off (output unchanged). While an
+      aim behavior is held, aim-scale-percent and aim-smoothing-ms apply
+      instead. Clamped to 0..200. Runtime-settable (SetSmoothingRequest) and
+      persisted; this is the default.
+
   click-freeze-ms:
     type: int
     default: 0

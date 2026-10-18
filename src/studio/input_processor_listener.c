@@ -84,6 +84,8 @@ static int input_processor_state_changed_listener(const zmk_event_t *eh) {
     info->aim_scale_percent = ev->config.aim_scale_percent;
     info->aim_smoothing_ms = ev->config.aim_smoothing_ms;
     info->aim_supported = true;
+    info->smoothing_ms = ev->config.smoothing_ms;
+    info->smoothing_supported = true;
     info->temp_layer_enabled = ev->config.temp_layer_enabled;
     info->temp_layer_layer = ev->config.temp_layer_layer;
     info->temp_layer_activation_delay_ms = ev->config.temp_layer_activation_delay_ms;

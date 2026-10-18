@@ -8,7 +8,8 @@
  * Pure math for the runtime input processor's aim mode: while an aim key is
  * held, cursor output is slowed down and low-pass filtered, so the small fast
  * back-and-forth of a trembling thumb cancels out while deliberate motion
- * still arrives, a little later.
+ * still arrives, a little later. Normal smoothing (end of this file) runs the
+ * same filter at full speed while no aim key is held.
  *
  * Kept free of Zephyr dependencies so it can be unit-tested on the host
  * (see tests/host/aim_math_test.c). Integer only, no floats.
@@ -152,4 +153,55 @@ static inline int16_t rip_aim_apply_event(struct rip_aim_axis *axis, int16_t val
     }
     axis->pending = (int32_t)pending;
     return rip_aim_tick(axis, now_ms, tau_ms);
+}
+
+/*
+ * Normal smoothing: the same filter while no aim key is held, at full speed
+ * and with its own time constant (smoothing-ms, 0 = off). Both modes share one
+ * pending/frac per axis, so switching between them neither drops nor repeats
+ * what is held back; it is only released at the new mode's pace. With normal
+ * smoothing off, an event passes unchanged plus whatever aim still holds back,
+ * which drains at aim's pace, exactly as before normal smoothing existed.
+ */
+
+/* Time constant that releases what is held back: aim's while an aim key is
+ * held, the normal one otherwise, and aim's again (draining what aim left)
+ * while normal smoothing is off. */
+static inline uint32_t rip_smooth_tau(bool aim_held, uint32_t aim_tau_ms, uint32_t normal_tau_ms) {
+    return (aim_held || normal_tau_ms == 0) ? aim_tau_ms : normal_tau_ms;
+}
+
+/* True when an event passes untouched: no aim key held, normal smoothing off
+ * and nothing held back. */
+static inline bool rip_smooth_passthrough(const struct rip_aim_axis *axis, bool aim_held,
+                                          uint32_t normal_tau_ms) {
+    return !aim_held && normal_tau_ms == 0 && rip_aim_idle(axis);
+}
+
+/*
+ * Filter one single-axis event that is not a passthrough one and return the
+ * whole counts to output: slowed and smoothed while aim is held, smoothed at
+ * full speed with normal smoothing, otherwise the event plus what aim still
+ * holds back (the sub-count rest is dropped once nothing is held back).
+ */
+static inline int16_t rip_smooth_event(struct rip_aim_axis *axis, int16_t value, uint32_t now_ms,
+                                       bool aim_held, int64_t aim_percent, uint32_t aim_tau_ms,
+                                       uint32_t normal_tau_ms) {
+    if (aim_held) {
+        return rip_aim_apply_event(axis, value, now_ms, aim_percent, aim_tau_ms);
+    }
+    if (normal_tau_ms > 0) {
+        return rip_aim_apply_event(axis, value, now_ms, RIP_AIM_MAX_PERCENT, normal_tau_ms);
+    }
+    int32_t sum = (int32_t)value + rip_aim_tick(axis, now_ms, aim_tau_ms);
+    if (rip_aim_idle(axis)) {
+        axis->frac = 0;
+    }
+    if (sum > INT16_MAX) {
+        return INT16_MAX;
+    }
+    if (sum < INT16_MIN) {
+        return INT16_MIN;
+    }
+    return (int16_t)sum;
 }

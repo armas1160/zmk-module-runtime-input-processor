@@ -655,6 +655,37 @@ and load the aim settings from the devicetree). Over Studio RPC it is
 `zmk_input_processor_runtime_aim()`. The temporary-config behavior leaves
 them unchanged while held and restores the saved values on release.
 
+### Normal Smoothing
+
+`smoothing-ms` (default `0` = off) runs the aim filter while no aim key is
+held, at full speed: the cursor trails the ball by about this long, small
+fast back-and-forth is damped, and what the filter holds back is released
+once the ball stops (the same release work as aim mode). Clamped to
+`0..200`. With `0` the output is exactly as without it.
+
+While an aim key is held, the aim speed and smoothing apply instead. Both
+modes share the filter, so pressing or releasing an aim key neither drops
+nor repeats what is held back: it is only released at the new mode's pace.
+A mouse button press or release forgets what is held back (as in aim mode),
+so the cursor stays where the click landed, and nothing is released while
+click freeze drops input. Inertia measures the input before the filter.
+While the cursor is still catching up after the last input, the temp-layer
+layer stays active (only with normal smoothing on; aim's release keeps the
+old timing).
+
+```dts
+&my_rip {
+    smoothing-ms = <30>;
+};
+```
+
+It follows the same write modes as the other settings and is saved with them
+(settings blob version 7; older records load with the devicetree default).
+Over Studio RPC it is `SetSmoothingRequest` and the `smoothing_ms` and
+`smoothing_supported` fields of `InputProcessorInfo`; the firmware API is
+`zmk_input_processor_runtime_set_smoothing()`. It only affects cursor (REL_X /
+REL_Y) output, not processors that map motion to scroll.
+
 ### Click Freeze
 
 `click-freeze-ms` (default `0` = off) drops the processor's input for that

@@ -65,6 +65,9 @@ message InputProcessorInfo {
     uint32 aim_scale_percent = 35;  // 10..100, cursor speed while aiming
     uint32 aim_smoothing_ms = 36;   // 0..200, smoothing time constant; 0 = off
     bool aim_supported = 37;        // always true in this fork, so clients can detect support
+    // Normal smoothing (the aim filter at full speed while no aim key is held)
+    uint32 smoothing_ms = 38;  // 0..200, smoothing when aim is not held; 0 = off
+    bool smoothing_supported = 39;  // always true in this fork
 }
 
 message ListInputProcessorsRequest {
@@ -359,6 +362,14 @@ message SetAimRequest {
 }
 message SetAimResponse {}
 
+// Normal smoothing: out-of-range values are clamped, not rejected.
+message SetSmoothingRequest {
+    uint32 id = 1;
+    uint32 value = 2;         // Time constant in ms, clamped to 0..200 (0 = off)
+    WriteMode write_mode = 3; // Where to store the value (default: persist)
+}
+message SetSmoothingResponse {}
+
 // Persist every processor's current in-memory settings to flash. Flushes values
 // that were set with WRITE_MODE_MEMORY.
 message SaveAllSettingsRequest {
@@ -427,6 +438,7 @@ message Request {
         SetTiltAxisRequest set_tilt_axis = 35;
         SetAccelRequest set_accel = 36;
         SetAimRequest set_aim = 37;
+        SetSmoothingRequest set_smoothing = 38;
     }
 }
 
@@ -471,6 +483,7 @@ message Response {
         SetTiltAxisResponse set_tilt_axis = 36;
         SetAccelResponse set_accel = 37;
         SetAimResponse set_aim = 38;
+        SetSmoothingResponse set_smoothing = 39;
     }
 }
 

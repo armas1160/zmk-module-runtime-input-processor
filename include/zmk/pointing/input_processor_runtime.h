@@ -47,6 +47,8 @@ struct zmk_input_processor_runtime_config {
     // smoothing time constant (0..200 ms, 0 = no smoothing)
     uint8_t aim_scale_percent;
     uint8_t aim_smoothing_ms;
+    // Normal smoothing while no aim key is held (0..200 ms, 0 = off)
+    uint8_t smoothing_ms;
     // Temp-layer layer settings
     bool temp_layer_enabled;
     uint8_t temp_layer_layer;
@@ -166,6 +168,23 @@ int zmk_input_processor_runtime_set_accel(const struct device *dev, uint32_t per
 int zmk_input_processor_runtime_set_aim(const struct device *dev, uint32_t scale_percent,
                                         uint32_t smoothing_ms,
                                         enum zmk_input_processor_runtime_write_mode mode);
+
+/**
+ * @brief Set normal smoothing: the aim filter at full speed while no aim key is held
+ *
+ * Cursor output is low-pass filtered with time constant ms, as aim mode does
+ * but without slowing down; what the filter holds back is released once input
+ * stops. While an aim key is held, the aim speed and smoothing apply instead,
+ * and what is held back carries over between the two. 0 turns it off (output
+ * exactly as without it). The devicetree smoothing-ms is the default.
+ *
+ * @param dev Pointer to the device structure
+ * @param ms Smoothing time constant in ms; clamped to 0..200 (0 = off)
+ * @param mode Where to store the value (persist to flash, memory-only, or temporary)
+ * @return 0 on success, negative error code on failure
+ */
+int zmk_input_processor_runtime_set_smoothing(const struct device *dev, uint32_t ms,
+                                              enum zmk_input_processor_runtime_write_mode mode);
 
 /**
  * @brief Reset processor to default values and save to persistent storage
@@ -543,6 +562,9 @@ int zmk_input_processor_runtime_test_apply_legacy_v4(const struct device *dev);
 
 /** @brief Test-only: apply a v5 blob (rotation 46) without the aim fields. */
 int zmk_input_processor_runtime_test_apply_legacy_v5(const struct device *dev);
+
+/** @brief Test-only: apply a v6 blob (rotation 47) without normal smoothing. */
+int zmk_input_processor_runtime_test_apply_legacy_v6(const struct device *dev);
 
 /** @brief Test-only: verify timed report splitting and rolling expiration. */
 int zmk_input_processor_runtime_test_inertia_sliding_window(void);

@@ -6,3 +6,4 @@ s/.*PASS: rip_inertia_latest_bucket_compensation/PASS: rip_inertia_latest_bucket
 s/.*PASS: rip_tilt_compensation/PASS: rip_tilt_compensation/p
 s/.*PASS: rip_pointer_accel/PASS: rip_pointer_accel/p
 s/.*PASS: rip_aim_settings/PASS: rip_aim_settings/p
+s/.*PASS: rip_normal_smoothing/PASS: rip_normal_smoothing/p

@@ -1486,6 +1486,153 @@ static int test_aim(void) {
     return 0;
 }
 
+static int check_smoothing_config(const struct device *dev, uint8_t smoothing, const char *what) {
+    struct zmk_input_processor_runtime_config cfg;
+    int ret = zmk_input_processor_runtime_get_config(dev, NULL, &cfg);
+    if (ret < 0) {
+        return ret;
+    }
+    if (cfg.smoothing_ms != smoothing) {
+        LOG_ERR("%s: smoothing %u ms expected %u ms", what, cfg.smoothing_ms, smoothing);
+        return -EINVAL;
+    }
+    return 0;
+}
+
+/* Normal smoothing: clamping, 0 as passthrough, what is held back carried
+ * into aim mode, write modes, v7 persistence and the v6 upgrade. test.dtsi
+ * sets no smoothing-ms, so the devicetree default is 0. No time passes during
+ * this SYS_INIT test, so the filter releases nothing on its own. */
+static int test_smoothing(void) {
+    const struct device *dev = zmk_input_processor_runtime_find_by_name(TEST_PROCESSOR_NAME);
+    if (!dev) {
+        LOG_ERR("Test processor '%s' not found", TEST_PROCESSOR_NAME);
+        return -ENODEV;
+    }
+
+    struct zmk_input_processor_runtime_config cfg;
+    int ret;
+
+    if ((ret = check_smoothing_config(dev, 0, "Smoothing default")) < 0) {
+        return ret;
+    }
+
+    /* Out-of-range requests are clamped, not rejected. */
+    static const struct {
+        uint32_t in;
+        uint8_t out;
+    } smoothing_cases[] = {{300, 200}, {0, 0}, {80, 80}};
+    for (size_t i = 0; i < ARRAY_SIZE(smoothing_cases); i++) {
+        if ((ret = zmk_input_processor_runtime_set_smoothing(
+                 dev, smoothing_cases[i].in, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_MEMORY)) < 0 ||
+            (ret = check_smoothing_config(dev, smoothing_cases[i].out, "Smoothing clamp")) < 0) {
+            return ret;
+        }
+    }
+
+    /* A temporary change leaves the saved value alone. */
+    if ((ret = zmk_input_processor_runtime_set_smoothing(
+             dev, 10, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY)) < 0 ||
+        (ret = check_smoothing_config(dev, 80, "Smoothing temporary")) < 0) {
+        return ret;
+    }
+
+    /* Isolate the filter from rotation, tilt, scaling, acceleration and inertia. */
+    if ((ret = zmk_input_processor_runtime_set_rotation(
+             dev, 0, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY)) < 0 ||
+        (ret = zmk_input_processor_runtime_set_tilt(
+             dev, 0, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY)) < 0 ||
+        (ret = zmk_input_processor_runtime_set_scaling(
+             dev, 1, 1, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY)) < 0 ||
+        (ret = zmk_input_processor_runtime_set_accel(
+             dev, 100, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY)) < 0 ||
+        (ret = zmk_input_processor_runtime_set_inertia_enabled(
+             dev, false, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY)) < 0) {
+        return ret;
+    }
+
+    /* 0 passes events untouched. */
+    int32_t out[3];
+    if ((ret = zmk_input_processor_runtime_set_smoothing(
+             dev, 0, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY)) < 0 ||
+        (ret = process_test_relative(dev, INPUT_REL_X, 7, &out[0])) < 0) {
+        return ret;
+    }
+    if (out[0] != 7) {
+        LOG_ERR("Smoothing 0 changed an event: 7 -> %d", out[0]);
+        return -EINVAL;
+    }
+
+    /* With smoothing, motion from rest is held back at full speed; pressing
+     * aim (here unsmoothed at 100 %) lets it out with the next event, once. */
+    if ((ret = zmk_input_processor_runtime_set_smoothing(
+             dev, 50, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY)) < 0 ||
+        (ret = zmk_input_processor_runtime_set_aim(
+             dev, 100, 0, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY)) < 0 ||
+        (ret = process_test_relative(dev, INPUT_REL_X, 10, &out[0])) < 0) {
+        return ret;
+    }
+    zmk_input_processor_runtime_aim(dev, true);
+    if ((ret = process_test_relative(dev, INPUT_REL_X, 0, &out[1])) < 0 ||
+        (ret = process_test_relative(dev, INPUT_REL_X, 0, &out[2])) < 0) {
+        zmk_input_processor_runtime_aim(dev, false);
+        return ret;
+    }
+    zmk_input_processor_runtime_aim(dev, false);
+    if (out[0] != 0 || out[1] != 10 || out[2] != 0) {
+        LOG_ERR("Smoothing into aim: got %d, %d, %d expected 0, 10, 0", out[0], out[1], out[2]);
+        return -EINVAL;
+    }
+    zmk_input_processor_runtime_restore_persistent(dev);
+
+    /* v7 persistence round trip; reset restores the devicetree default. */
+    ret = zmk_input_processor_runtime_set_smoothing(dev, 120,
+                                                    ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_PERSIST);
+    if (ret < 0) {
+        return ret;
+    }
+    zmk_input_processor_runtime_test_flush_save(dev);
+    zmk_input_processor_runtime_reset(dev);
+    if ((ret = check_smoothing_config(dev, 0, "Smoothing reset")) < 0) {
+        return ret;
+    }
+    ret = settings_load_subtree("custom_settings");
+    if (ret < 0) {
+        return ret;
+    }
+    zmk_input_processor_runtime_test_apply_persisted_settings();
+    if ((ret = check_smoothing_config(dev, 120, "Smoothing persisted")) < 0) {
+        return ret;
+    }
+
+    /* A memory-only change is dropped by discard. */
+    if ((ret = zmk_input_processor_runtime_set_smoothing(
+             dev, 30, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_MEMORY)) < 0 ||
+        (ret = zmk_input_processor_runtime_discard_all()) < 0 ||
+        (ret = check_smoothing_config(dev, 120, "Smoothing discard")) < 0) {
+        return ret;
+    }
+
+    /* A v6 record (no normal smoothing) keeps its own values and takes the
+     * devicetree default. */
+    if ((ret = zmk_input_processor_runtime_set_aim(
+             dev, 55, 70, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_MEMORY)) < 0 ||
+        (ret = zmk_input_processor_runtime_test_apply_legacy_v6(dev)) < 0) {
+        return ret;
+    }
+    zmk_input_processor_runtime_get_config(dev, NULL, &cfg);
+    if (cfg.rotation_degrees != 47 || cfg.aim_scale_percent != 55 || cfg.aim_smoothing_ms != 70 ||
+        cfg.smoothing_ms != 0) {
+        LOG_ERR("Legacy v6 settings were not migrated: rot=%d aim=%u%%/%u ms smoothing=%u ms",
+                cfg.rotation_degrees, cfg.aim_scale_percent, cfg.aim_smoothing_ms,
+                cfg.smoothing_ms);
+        return -EINVAL;
+    }
+
+    LOG_INF("PASS: rip_normal_smoothing");
+    return 0;
+}
+
 static int rip_settings_test_init(void) {
     int ret = test_settings_backend_init();
     if (ret < 0) {
@@ -1521,6 +1668,11 @@ static int rip_settings_test_init(void) {
     ret = test_aim();
     if (ret < 0) {
         LOG_ERR("FAIL: rip_aim_settings ret=%d", ret);
+    }
+
+    ret = test_smoothing();
+    if (ret < 0) {
+        LOG_ERR("FAIL: rip_normal_smoothing ret=%d", ret);
     }
     return 0;
 }

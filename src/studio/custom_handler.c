@@ -68,6 +68,8 @@ static int handle_set_tilt_axis(const cormoran_rip_SetTiltAxisRequest *req,
                                 cormoran_rip_Response *resp);
 static int handle_set_accel(const cormoran_rip_SetAccelRequest *req, cormoran_rip_Response *resp);
 static int handle_set_aim(const cormoran_rip_SetAimRequest *req, cormoran_rip_Response *resp);
+static int handle_set_smoothing(const cormoran_rip_SetSmoothingRequest *req,
+                                cormoran_rip_Response *resp);
 static int handle_reset_input_processor(const cormoran_rip_ResetInputProcessorRequest *req,
                                         cormoran_rip_Response *resp);
 static int handle_set_temp_layer_enabled(const cormoran_rip_SetTempLayerEnabledRequest *req,
@@ -184,6 +186,9 @@ static bool rip_rpc_handle_request(const zmk_custom_CallRequest *raw_request,
         break;
     case cormoran_rip_Request_set_aim_tag:
         rc = handle_set_aim(&req.request_type.set_aim, resp);
+        break;
+    case cormoran_rip_Request_set_smoothing_tag:
+        rc = handle_set_smoothing(&req.request_type.set_smoothing, resp);
         break;
     case cormoran_rip_Request_reset_input_processor_tag:
         rc = handle_reset_input_processor(&req.request_type.reset_input_processor, resp);
@@ -381,6 +386,8 @@ static int handle_get_input_processor(const cormoran_rip_GetInputProcessorReques
     result.processor.aim_scale_percent = config.aim_scale_percent;
     result.processor.aim_smoothing_ms = config.aim_smoothing_ms;
     result.processor.aim_supported = true;
+    result.processor.smoothing_ms = config.smoothing_ms;
+    result.processor.smoothing_supported = true;
     result.processor.temp_layer_enabled = config.temp_layer_enabled;
     result.processor.temp_layer_layer = config.temp_layer_layer;
     result.processor.temp_layer_activation_delay_ms = config.temp_layer_activation_delay_ms;
@@ -618,6 +625,35 @@ static int handle_set_aim(const cormoran_rip_SetAimRequest *req, cormoran_rip_Re
     resp->which_response_type = cormoran_rip_Response_set_aim_tag;
     resp->response_type.set_aim =
         (cormoran_rip_SetAimResponse)cormoran_rip_SetAimResponse_init_zero;
+
+    return 0;
+}
+
+/**
+ * Handle setting normal smoothing (clamped to 0..200 ms, 0 = off)
+ */
+static int handle_set_smoothing(const cormoran_rip_SetSmoothingRequest *req,
+                                cormoran_rip_Response *resp) {
+    LOG_DBG("Setting smoothing for id=%d to %u ms", req->id, req->value);
+
+    const struct device *dev = zmk_input_processor_runtime_find_by_id(req->id);
+    if (!dev) {
+        LOG_WRN("Input processor not found: id=%d", req->id);
+        return -ENODEV;
+    }
+
+    // Set normal smoothing (write mode per request)
+    int ret =
+        zmk_input_processor_runtime_set_smoothing(dev, req->value, rip_write_mode(req->write_mode));
+    if (ret < 0) {
+        LOG_ERR("Failed to set smoothing: %d", ret);
+        return ret;
+    }
+
+    // Return empty response
+    resp->which_response_type = cormoran_rip_Response_set_smoothing_tag;
+    resp->response_type.set_smoothing =
+        (cormoran_rip_SetSmoothingResponse)cormoran_rip_SetSmoothingResponse_init_zero;
 
     return 0;
 }

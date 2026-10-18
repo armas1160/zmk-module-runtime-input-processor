@@ -58,6 +58,9 @@ struct runtime_processor_config {
     // rip_aim_math.h). Kept raw and clamped when applied.
     int32_t initial_aim_scale_percent;
     int32_t initial_aim_smoothing_ms;
+    // Normal smoothing default from DT: the same filter at full speed while no
+    // aim key is held (0 = off). Kept raw and clamped when applied.
+    int32_t initial_smoothing_ms;
     // Input dropped after a mouse button press or release (0 = off)
     uint32_t click_freeze_ms;
     // Temp-layer behavior references for efficient comparison
@@ -139,6 +142,7 @@ struct runtime_processor_data {
     uint8_t accel_min_percent; // [RIP_ACCEL_MIN_PERCENT, 100], 100 = off
     uint8_t aim_scale_percent; // [RIP_AIM_MIN_PERCENT, RIP_AIM_MAX_PERCENT]
     uint8_t aim_smoothing_ms;  // [0, RIP_AIM_MAX_SMOOTHING_MS], 0 = no smoothing
+    uint8_t smoothing_ms;      // [0, RIP_AIM_MAX_SMOOTHING_MS] when aim is not held, 0 = off
 
     // Persistent values (saved to settings, not affected by behavior)
     uint32_t persistent_scale_multiplier;
@@ -149,6 +153,7 @@ struct runtime_processor_data {
     uint8_t persistent_accel_min_percent;
     uint8_t persistent_aim_scale_percent;
     uint8_t persistent_aim_smoothing_ms;
+    uint8_t persistent_smoothing_ms;
 
     // Precomputed rotation + tilt transform (x1000, see rip_tilt_math.h)
     struct rip_tilt_matrix transform;
@@ -160,9 +165,10 @@ struct runtime_processor_data {
     // remainders (permille, see rip_accel_math.h)
     struct rip_accel_state accel_state;
 
-    // Aim mode: how many aim keys are held, the filter per output axis (X, Y)
-    // and the work that releases what is left once input stops. aim_lock
-    // guards aim_axis between the input thread and the work.
+    // Aim mode and normal smoothing: how many aim keys are held, the filter
+    // per output axis (X, Y, shared by both modes) and the work that releases
+    // what is left once input stops. aim_lock guards aim_axis between the
+    // input thread and the work.
     uint8_t aim_hold_count;
     struct rip_aim_axis aim_axis[2];
     struct k_spinlock aim_lock;
@@ -923,18 +929,20 @@ static void aim_work_handler(struct k_work *work) {
 
     k_spinlock_key_t key = k_spin_lock(&data->aim_lock);
     uint32_t now = (uint32_t)k_uptime_get();
+    bool held = data->aim_hold_count > 0;
+    uint32_t tau = rip_smooth_tau(held, data->aim_smoothing_ms, data->smoothing_ms);
     int16_t out[2] = {0, 0};
     for (int i = 0; i < 2; i++) {
         // An axis still getting events releases there; step only quiet ones
         struct rip_aim_axis *state = &data->aim_axis[i];
         if (!rip_aim_idle(state) && now - state->last_ms >= AIM_INTERVAL_MS) {
-            out[i] = rip_aim_tick(state, now, data->aim_smoothing_ms);
+            out[i] = rip_aim_tick(state, now, tau);
         }
     }
     int16_t x = out[0];
     int16_t y = out[1];
     bool busy = aim_busy(data);
-    if (!busy && data->aim_hold_count == 0) {
+    if (!busy && !held) {
         // Done after release: a fraction below one count is not worth a late move
         data->aim_axis[0].frac = 0;
         data->aim_axis[1].frac = 0;
@@ -943,15 +951,25 @@ static void aim_work_handler(struct k_work *work) {
 
     if (x != 0 || y != 0) {
         aim_emit(x, y);
+        // With normal smoothing the cursor keeps catching up after the last
+        // input: that is still use, so the temp layer (and its clicks) stays
+        // until the cursor has stopped. Smoothing 0 keeps the old timing.
+        if (!held && data->smoothing_ms > 0 && data->temp_layer_enabled &&
+            data->temp_layer_layer_active && !data->temp_layer_keep_active) {
+            k_work_reschedule(&data->temp_layer_deactivation_work,
+                              K_MSEC(data->temp_layer_deactivation_delay_ms));
+        }
     }
     if (busy) {
         k_work_reschedule(&data->aim_work, K_MSEC(AIM_INTERVAL_MS));
     }
 }
 
-/* Aim mode on one cursor event, after scaling (see rip_aim_math.h). While an
- * aim key is held the event is slowed down and filtered. After release, what
- * the filter still holds is added to the passing events until it is gone.
+/* Aim mode and normal smoothing on one cursor event, after scaling (see
+ * rip_aim_math.h). While an aim key is held the event is slowed down and
+ * filtered; otherwise normal smoothing filters it at full speed. With normal
+ * smoothing off, what the filter still holds after an aim release is added to
+ * the passing events until it is gone, and events pass untouched otherwise.
  * The work runs every AIM_INTERVAL_MS while anything is held back and
  * releases it on the axes that have gone quiet. */
 static void aim_handle_event(struct runtime_processor_data *data, struct input_event *event) {
@@ -962,23 +980,16 @@ static void aim_handle_event(struct runtime_processor_data *data, struct input_e
 
     k_spinlock_key_t key = k_spin_lock(&data->aim_lock);
     struct rip_aim_axis *state = &data->aim_axis[axis];
-    if (data->aim_hold_count == 0 && rip_aim_idle(state)) {
+    bool held = data->aim_hold_count > 0;
+    if (rip_smooth_passthrough(state, held, data->smoothing_ms)) {
         k_spin_unlock(&data->aim_lock, key);
         return;
     }
 
     uint32_t now = (uint32_t)k_uptime_get();
     int16_t value = (int16_t)CLAMP(event->value, INT16_MIN, INT16_MAX);
-    if (data->aim_hold_count > 0) {
-        event->value =
-            rip_aim_apply_event(state, value, now, data->aim_scale_percent, data->aim_smoothing_ms);
-    } else {
-        int32_t sum = (int32_t)value + rip_aim_tick(state, now, data->aim_smoothing_ms);
-        event->value = CLAMP(sum, INT16_MIN, INT16_MAX);
-        if (rip_aim_idle(state)) {
-            state->frac = 0;
-        }
-    }
+    event->value = rip_smooth_event(state, value, now, held, data->aim_scale_percent,
+                                    data->aim_smoothing_ms, data->smoothing_ms);
     bool busy = aim_busy(data);
     k_spin_unlock(&data->aim_lock, key);
 
@@ -1227,8 +1238,8 @@ static int runtime_processor_handle_event(const struct device *dev, struct input
         inertia_handle_physical_event(data, is_x ? 0 : 1, event, inertia_raw_value);
     }
 
-    // Aim mode (slowed and smoothed while an aim key is held) on the final
-    // cursor values
+    // Aim mode (slowed and smoothed while an aim key is held) and normal
+    // smoothing on the final cursor values
     aim_handle_event(data, event);
 
     // Schedule deactivation after input stops (held aim keeps the layer)
@@ -1268,7 +1279,7 @@ static struct zmk_input_processor_driver_api runtime_processor_driver_api = {
  * see the load path below), so the generic surface is for visibility/inspection.
  */
 #define RIP_SETTINGS_SUBSYSTEM_ID "cormoran_rip"
-#define RIP_SETTINGS_BLOB_VERSION 6
+#define RIP_SETTINGS_BLOB_VERSION 7
 
 /*
  * The persisted-on-flash v1 struct for one processor's original 15 settings
@@ -1372,7 +1383,14 @@ struct rip_persist_v6 {
     uint8_t aim_smoothing_ms;
 } __packed;
 
-#define RIP_SETTINGS_BLOB_SIZE (1 + sizeof(struct rip_persist_v6))
+/* v7 adds normal smoothing: v6 and one byte, so a v6 record is the start of
+ * a v7 one. 1 + sizeof(v7) is 53 bytes, leaving 11. */
+struct rip_persist_v7 {
+    struct rip_persist_v6 v6;
+    uint8_t smoothing_ms;
+} __packed;
+
+#define RIP_SETTINGS_BLOB_SIZE (1 + sizeof(struct rip_persist_v7))
 
 /* The entry below is a plain ZMK_CUSTOM_SETTING_DEFINE BYTES setting, whose
  * value holds at most CONFIG_ZMK_CUSTOM_SETTINGS_VALUE_MAX_SIZE bytes; the
@@ -1399,35 +1417,38 @@ BUILD_ASSERT(RIP_SETTINGS_BLOB_SIZE <= CONFIG_ZMK_CUSTOM_SETTINGS_VALUE_MAX_SIZE
  * and returns the number of bytes written. Version byte is written separately
  * from the struct memcpy so no wrapper-struct padding enters the layout. */
 static size_t pack_processor_settings(const struct runtime_processor_data *data, uint8_t *buf) {
-    struct rip_persist_v6 settings = {
-        .scale_multiplier = data->persistent_scale_multiplier,
-        .scale_divisor = data->persistent_scale_divisor,
-        .rotation_degrees = data->persistent_rotation_degrees,
-        .active_layers = data->persistent_active_layers,
-        .temp_layer_enabled = data->persistent_temp_layer_enabled,
-        .temp_layer_layer = data->persistent_temp_layer_layer,
-        .temp_layer_activation_delay_ms = data->persistent_temp_layer_activation_delay_ms,
-        .temp_layer_deactivation_delay_ms = data->persistent_temp_layer_deactivation_delay_ms,
-        .axis_snap_mode = data->persistent_axis_snap_mode,
-        .axis_snap_threshold = data->persistent_axis_snap_threshold,
-        .axis_snap_timeout_ms = data->persistent_axis_snap_timeout_ms,
-        .xy_to_scroll_enabled = data->persistent_xy_to_scroll_enabled,
-        .xy_swap_enabled = data->persistent_xy_swap_enabled,
-        .x_invert = data->persistent_x_invert,
-        .y_invert = data->persistent_y_invert,
-        .inertia_enabled = data->persistent_inertia_enabled,
-        .inertia_window_ms = data->persistent_inertia_window_ms,
-        .inertia_interval_ms = data->persistent_inertia_interval_ms,
-        .inertia_threshold = data->persistent_inertia_threshold,
-        .inertia_decay_percent = data->persistent_inertia_decay_percent,
-        .inertia_fast_threshold = data->persistent_inertia_fast_threshold,
-        .inertia_fast_output_percent = data->persistent_inertia_fast_output_percent,
-        .inertia_normal_max_output = data->persistent_inertia_normal_max_output,
-        .tilt_degrees = data->persistent_tilt_degrees,
-        .tilt_axis_degrees = data->persistent_tilt_axis_degrees,
-        .accel_min_percent = data->persistent_accel_min_percent,
-        .aim_scale_percent = data->persistent_aim_scale_percent,
-        .aim_smoothing_ms = data->persistent_aim_smoothing_ms,
+    struct rip_persist_v7 settings = {
+        .v6 = {
+            .scale_multiplier = data->persistent_scale_multiplier,
+            .scale_divisor = data->persistent_scale_divisor,
+            .rotation_degrees = data->persistent_rotation_degrees,
+            .active_layers = data->persistent_active_layers,
+            .temp_layer_enabled = data->persistent_temp_layer_enabled,
+            .temp_layer_layer = data->persistent_temp_layer_layer,
+            .temp_layer_activation_delay_ms = data->persistent_temp_layer_activation_delay_ms,
+            .temp_layer_deactivation_delay_ms = data->persistent_temp_layer_deactivation_delay_ms,
+            .axis_snap_mode = data->persistent_axis_snap_mode,
+            .axis_snap_threshold = data->persistent_axis_snap_threshold,
+            .axis_snap_timeout_ms = data->persistent_axis_snap_timeout_ms,
+            .xy_to_scroll_enabled = data->persistent_xy_to_scroll_enabled,
+            .xy_swap_enabled = data->persistent_xy_swap_enabled,
+            .x_invert = data->persistent_x_invert,
+            .y_invert = data->persistent_y_invert,
+            .inertia_enabled = data->persistent_inertia_enabled,
+            .inertia_window_ms = data->persistent_inertia_window_ms,
+            .inertia_interval_ms = data->persistent_inertia_interval_ms,
+            .inertia_threshold = data->persistent_inertia_threshold,
+            .inertia_decay_percent = data->persistent_inertia_decay_percent,
+            .inertia_fast_threshold = data->persistent_inertia_fast_threshold,
+            .inertia_fast_output_percent = data->persistent_inertia_fast_output_percent,
+            .inertia_normal_max_output = data->persistent_inertia_normal_max_output,
+            .tilt_degrees = data->persistent_tilt_degrees,
+            .tilt_axis_degrees = data->persistent_tilt_axis_degrees,
+            .accel_min_percent = data->persistent_accel_min_percent,
+            .aim_scale_percent = data->persistent_aim_scale_percent,
+            .aim_smoothing_ms = data->persistent_aim_smoothing_ms,
+        },
+        .smoothing_ms = data->persistent_smoothing_ms,
     };
     buf[0] = RIP_SETTINGS_BLOB_VERSION;
     memcpy(&buf[1], &settings, sizeof(settings));
@@ -1435,8 +1456,8 @@ static size_t pack_processor_settings(const struct runtime_processor_data *data,
 }
 
 /* v1 has no inertia fields; start from the current devicetree defaults.
- * v1-v3 have no tilt fields, v1-v4 no acceleration field and v1-v5 no aim
- * fields; those take the devicetree defaults. */
+ * v1-v3 have no tilt fields, v1-v4 no acceleration field, v1-v5 no aim fields
+ * and v1-v6 no normal smoothing; those take the devicetree defaults. */
 static int unpack_and_apply_processor_settings(struct runtime_processor_data *data,
                                                const uint8_t *buf, size_t len) {
     const struct runtime_processor_config *cfg = data->dev->config;
@@ -1447,6 +1468,7 @@ static int unpack_and_apply_processor_settings(struct runtime_processor_data *da
     uint8_t accel_min_percent = rip_accel_clamp_min_percent(cfg->initial_accel_min_percent);
     uint8_t aim_scale_percent = rip_aim_clamp_percent(cfg->initial_aim_scale_percent);
     uint8_t aim_smoothing_ms = rip_aim_clamp_smoothing_ms(cfg->initial_aim_smoothing_ms);
+    uint8_t smoothing_ms = rip_aim_clamp_smoothing_ms(cfg->initial_smoothing_ms);
     if (len == 1 + sizeof(struct rip_persist_v1) && buf[0] == 1) {
         memcpy(&settings.v1, &buf[1], sizeof(settings.v1));
         settings.inertia_enabled = data->persistent_inertia_enabled;
@@ -1478,9 +1500,15 @@ static int unpack_and_apply_processor_settings(struct runtime_processor_data *da
         tilt_degrees = saved.v4.tilt_degrees;
         tilt_axis_degrees = saved.v4.tilt_axis_degrees;
         accel_min_percent = saved.accel_min_percent;
-    } else if (len == RIP_SETTINGS_BLOB_SIZE && buf[0] == RIP_SETTINGS_BLOB_VERSION) {
-        struct rip_persist_v6 saved;
-        memcpy(&saved, &buf[1], sizeof(saved));
+    } else if ((len == 1 + sizeof(struct rip_persist_v6) && buf[0] == 6) ||
+               (len == RIP_SETTINGS_BLOB_SIZE && buf[0] == RIP_SETTINGS_BLOB_VERSION)) {
+        // v6 is the start of v7; only v7 has the normal smoothing byte
+        struct rip_persist_v7 saved7;
+        memcpy(&saved7, &buf[1], len - 1);
+        if (buf[0] == RIP_SETTINGS_BLOB_VERSION) {
+            smoothing_ms = saved7.smoothing_ms;
+        }
+        struct rip_persist_v6 saved = saved7.v6;
         settings.v1 = (struct rip_persist_v1){
             .scale_multiplier = saved.scale_multiplier,
             .scale_divisor = saved.scale_divisor,
@@ -1530,7 +1558,7 @@ static int unpack_and_apply_processor_settings(struct runtime_processor_data *da
         return -EINVAL;
     }
     if (aim_scale_percent < RIP_AIM_MIN_PERCENT || aim_scale_percent > RIP_AIM_MAX_PERCENT ||
-        aim_smoothing_ms > RIP_AIM_MAX_SMOOTHING_MS) {
+        aim_smoothing_ms > RIP_AIM_MAX_SMOOTHING_MS || smoothing_ms > RIP_AIM_MAX_SMOOTHING_MS) {
         return -EINVAL;
     }
 
@@ -1544,6 +1572,7 @@ static int unpack_and_apply_processor_settings(struct runtime_processor_data *da
     data->accel_state = (struct rip_accel_state){0};
     data->persistent_aim_scale_percent = data->aim_scale_percent = aim_scale_percent;
     data->persistent_aim_smoothing_ms = data->aim_smoothing_ms = aim_smoothing_ms;
+    data->persistent_smoothing_ms = data->smoothing_ms = smoothing_ms;
     data->persistent_temp_layer_enabled = data->temp_layer_enabled = v1->temp_layer_enabled;
     data->persistent_temp_layer_layer = data->temp_layer_layer = v1->temp_layer_layer;
     data->persistent_temp_layer_activation_delay_ms = data->temp_layer_activation_delay_ms =
@@ -1576,7 +1605,8 @@ static int unpack_and_apply_processor_settings(struct runtime_processor_data *da
 }
 
 #if IS_ENABLED(CONFIG_ZMK_RUNTIME_INPUT_PROCESSOR_TEST)
-/* The processor's baseline in the nested v5 layout; v1-v4 are its prefixes. */
+/* The processor's baseline in the nested v5 layout; v1-v4 are its prefixes.
+ * The packed blob starts with v6 (the start of v7). */
 static struct rip_persist_v5 test_legacy_v5(const struct runtime_processor_data *data) {
     uint8_t current[RIP_SETTINGS_BLOB_SIZE];
     pack_processor_settings(data, current);
@@ -1669,6 +1699,21 @@ int zmk_input_processor_runtime_test_apply_legacy_v4(const struct device *dev) {
     return unpack_and_apply_processor_settings(data, blob, sizeof(blob));
 }
 
+int zmk_input_processor_runtime_test_apply_legacy_v6(const struct device *dev) {
+    if (!dev) {
+        return -EINVAL;
+    }
+    struct runtime_processor_data *data = dev->data;
+    uint8_t current[RIP_SETTINGS_BLOB_SIZE];
+    pack_processor_settings(data, current);
+    struct rip_persist_v7 settings;
+    memcpy(&settings, &current[1], sizeof(settings));
+    settings.v6.rotation_degrees = 47;
+    uint8_t blob[1 + sizeof(settings.v6)] = {6};
+    memcpy(&blob[1], &settings.v6, sizeof(settings.v6));
+    return unpack_and_apply_processor_settings(data, blob, sizeof(blob));
+}
+
 int zmk_input_processor_runtime_test_apply_legacy_v5(const struct device *dev) {
     if (!dev) {
         return -EINVAL;
@@ -1737,6 +1782,7 @@ static int runtime_processor_init(const struct device *dev) {
     data->accel_min_percent = rip_accel_clamp_min_percent(cfg->initial_accel_min_percent);
     data->aim_scale_percent = rip_aim_clamp_percent(cfg->initial_aim_scale_percent);
     data->aim_smoothing_ms = rip_aim_clamp_smoothing_ms(cfg->initial_aim_smoothing_ms);
+    data->smoothing_ms = rip_aim_clamp_smoothing_ms(cfg->initial_smoothing_ms);
 
     // Initialize persistent values same as current
     data->persistent_scale_multiplier = cfg->initial_scale_multiplier;
@@ -1747,6 +1793,7 @@ static int runtime_processor_init(const struct device *dev) {
     data->persistent_accel_min_percent = data->accel_min_percent;
     data->persistent_aim_scale_percent = data->aim_scale_percent;
     data->persistent_aim_smoothing_ms = data->aim_smoothing_ms;
+    data->persistent_smoothing_ms = data->smoothing_ms;
     data->accel_state = (struct rip_accel_state){0};
 
     // Initialize temp-layer settings from DT defaults
@@ -1916,6 +1963,7 @@ static void load_processor_defaults(const struct device *dev) {
     data->accel_min_percent = rip_accel_clamp_min_percent(cfg->initial_accel_min_percent);
     data->aim_scale_percent = rip_aim_clamp_percent(cfg->initial_aim_scale_percent);
     data->aim_smoothing_ms = rip_aim_clamp_smoothing_ms(cfg->initial_aim_smoothing_ms);
+    data->smoothing_ms = rip_aim_clamp_smoothing_ms(cfg->initial_smoothing_ms);
     data->persistent_scale_multiplier = cfg->initial_scale_multiplier;
     data->persistent_scale_divisor = cfg->initial_scale_divisor;
     data->persistent_rotation_degrees = cfg->initial_rotation_degrees;
@@ -1924,6 +1972,7 @@ static void load_processor_defaults(const struct device *dev) {
     data->persistent_accel_min_percent = data->accel_min_percent;
     data->persistent_aim_scale_percent = data->aim_scale_percent;
     data->persistent_aim_smoothing_ms = data->aim_smoothing_ms;
+    data->persistent_smoothing_ms = data->smoothing_ms;
     data->accel_state = (struct rip_accel_state){0};
 
     data->temp_layer_enabled = cfg->initial_temp_layer_enabled;
@@ -2121,6 +2170,27 @@ int zmk_input_processor_runtime_set_aim(const struct device *dev, uint32_t scale
     return commit_write(dev, mode);
 }
 
+int zmk_input_processor_runtime_set_smoothing(const struct device *dev, uint32_t ms,
+                                              enum zmk_input_processor_runtime_write_mode mode) {
+    if (!dev) {
+        return -EINVAL;
+    }
+
+    struct runtime_processor_data *data = dev->data;
+    uint8_t smoothing = rip_aim_clamp_smoothing_ms(ms);
+    // One byte, read by the input thread and the release work: what is held
+    // back is kept and released at the new pace (or with the next events and
+    // aim's pace once set to 0), so nothing jumps or is lost
+    data->smoothing_ms = smoothing;
+    if (mode != ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY) {
+        data->persistent_smoothing_ms = smoothing;
+    }
+
+    LOG_INF("Set smoothing to %u ms%s", smoothing, write_mode_label(mode));
+
+    return commit_write(dev, mode);
+}
+
 int zmk_input_processor_runtime_reset(const struct device *dev) {
     if (!dev) {
         return -EINVAL;
@@ -2153,6 +2223,7 @@ void zmk_input_processor_runtime_restore_persistent(const struct device *dev) {
     data->accel_state = (struct rip_accel_state){0};
     data->aim_scale_percent = data->persistent_aim_scale_percent;
     data->aim_smoothing_ms = data->persistent_aim_smoothing_ms;
+    data->smoothing_ms = data->persistent_smoothing_ms;
 
     // Restore axis snap settings
     data->axis_snap_mode = data->persistent_axis_snap_mode;
@@ -2205,6 +2276,7 @@ int zmk_input_processor_runtime_get_config(const struct device *dev, const char 
         config->accel_min_percent = data->persistent_accel_min_percent;
         config->aim_scale_percent = data->persistent_aim_scale_percent;
         config->aim_smoothing_ms = data->persistent_aim_smoothing_ms;
+        config->smoothing_ms = data->persistent_smoothing_ms;
         config->temp_layer_enabled = data->persistent_temp_layer_enabled;
         config->temp_layer_layer = data->persistent_temp_layer_layer;
         config->temp_layer_activation_delay_ms = data->persistent_temp_layer_activation_delay_ms;
@@ -2269,6 +2341,7 @@ int zmk_input_processor_runtime_get_config(const struct device *dev, const char 
         .accel_speed_high = DT_INST_PROP_OR(n, accel_speed_high, 150),                             \
         .initial_aim_scale_percent = (int32_t)DT_INST_PROP_OR(n, aim_scale_percent, 40),           \
         .initial_aim_smoothing_ms = (int32_t)DT_INST_PROP_OR(n, aim_smoothing_ms, 50),             \
+        .initial_smoothing_ms = (int32_t)DT_INST_PROP_OR(n, smoothing_ms, 0),                      \
         .click_freeze_ms = DT_INST_PROP_OR(n, click_freeze_ms, 0),                                 \
         .temp_layer_transparent_behavior = COND_CODE_1(                                            \
             DT_INST_NODE_HAS_PROP(n, temp_layer_transparent_behavior),                             \
@@ -2426,13 +2499,13 @@ static int apply_persisted_settings_cb(const struct device *dev, void *user_data
     }
 
     LOG_INF("Loaded settings for %s: scale=%d/%d, rotation=%d, tilt=%u@%d, accel=%u%%, "
-            "aim=%u%%/%ums, temp_layer=%d, active_layers=0x%08x, axis_snap=%d",
+            "aim=%u%%/%ums, smoothing=%ums, temp_layer=%d, active_layers=0x%08x, axis_snap=%d",
             cfg->name, data->persistent_scale_multiplier, data->persistent_scale_divisor,
             data->persistent_rotation_degrees, data->persistent_tilt_degrees,
             data->persistent_tilt_axis_degrees, data->persistent_accel_min_percent,
             data->persistent_aim_scale_percent, data->persistent_aim_smoothing_ms,
-            data->persistent_temp_layer_enabled, data->persistent_active_layers,
-            data->persistent_axis_snap_mode);
+            data->persistent_smoothing_ms, data->persistent_temp_layer_enabled,
+            data->persistent_active_layers, data->persistent_axis_snap_mode);
     return 0;
 }
 

@@ -267,6 +267,196 @@ static void test_int16_limit(void) {
     CHECK(a.pending <= RIP_AIM_PENDING_MAX && a.pending > 0, "saturated: %d", a.pending);
 }
 
+/* --- Normal smoothing (rip_smooth_*) ------------------------------------ */
+
+/* The event and release-work logic of the runtime before normal smoothing,
+ * kept here as the reference that smoothing 0 must reproduce exactly. The
+ * work releases an axis that has had no event for INTERVAL ms and drops the
+ * rest below one count once nothing is held back after release. */
+static int16_t ref_event(struct rip_aim_axis *a, int16_t v, uint32_t now, bool held) {
+    if (!held && rip_aim_idle(a)) {
+        return v;
+    }
+    if (held) {
+        return rip_aim_apply_event(a, v, now, PERCENT, TAU);
+    }
+    int32_t sum = (int32_t)v + rip_aim_tick(a, now, TAU);
+    if (rip_aim_idle(a)) {
+        a->frac = 0;
+    }
+    return (int16_t)(sum > INT16_MAX ? INT16_MAX : (sum < INT16_MIN ? INT16_MIN : sum));
+}
+
+static int16_t ref_work(struct rip_aim_axis *a, uint32_t now, bool held) {
+    int16_t out = 0;
+    if (!rip_aim_idle(a) && now - a->last_ms >= INTERVAL) {
+        out = rip_aim_tick(a, now, TAU);
+    }
+    if (rip_aim_idle(a) && !held) {
+        a->frac = 0;
+    }
+    return out;
+}
+
+/* The same through the new helpers, with normal smoothing ntau. */
+static int16_t new_event(struct rip_aim_axis *a, int16_t v, uint32_t now, bool held,
+                         uint32_t ntau) {
+    if (rip_smooth_passthrough(a, held, ntau)) {
+        return v;
+    }
+    return rip_smooth_event(a, v, now, held, PERCENT, TAU, ntau);
+}
+
+static int16_t new_work(struct rip_aim_axis *a, uint32_t now, bool held, uint32_t ntau) {
+    int16_t out = 0;
+    if (!rip_aim_idle(a) && now - a->last_ms >= INTERVAL) {
+        out = rip_aim_tick(a, now, rip_smooth_tau(held, TAU, ntau));
+    }
+    if (rip_aim_idle(a) && !held) {
+        a->frac = 0;
+    }
+    return out;
+}
+
+static void test_smooth_tau(void) {
+    CHECK(rip_smooth_tau(true, 50, 80) == 50, "held uses aim tau");
+    CHECK(rip_smooth_tau(true, 50, 0) == 50, "held, normal off");
+    CHECK(rip_smooth_tau(false, 50, 80) == 80, "not held uses normal tau");
+    CHECK(rip_smooth_tau(false, 50, 0) == 50, "normal off drains at aim tau");
+
+    struct rip_aim_axis a = {0};
+    CHECK(rip_smooth_passthrough(&a, false, 0), "idle, not held, off: passthrough");
+    CHECK(!rip_smooth_passthrough(&a, true, 0), "held: no passthrough");
+    CHECK(!rip_smooth_passthrough(&a, false, 30), "normal smoothing: no passthrough");
+    a.pending = 1;
+    CHECK(!rip_smooth_passthrough(&a, false, 0), "held back: no passthrough");
+}
+
+/* Smoothing 0 gives exactly the old outputs and states, for any mix of aim
+ * presses, events, pauses and release work. */
+static void test_smooth_off_matches_old(void) {
+    srand(4321);
+    for (int run = 0; run < 300; run++) {
+        struct rip_aim_axis r = {0};
+        struct rip_aim_axis n = {0};
+        uint32_t now = (uint32_t)rand();
+        bool held = false;
+        for (int i = 0; i < 300; i++) {
+            int op = rand() % 10;
+            int16_t ro = 0;
+            int16_t no = 0;
+            if (op == 0) {
+                held = !held;
+            } else if (op <= 2) {
+                now += (uint32_t)(rand() % 40);
+                ro = ref_work(&r, now, held);
+                no = new_work(&n, now, held, 0);
+            } else {
+                now += (uint32_t)(rand() % 12);
+                int16_t v = (int16_t)(rand() % 9 == 0 ? rand() % 2001 - 1000 : rand() % 41 - 20);
+                ro = ref_event(&r, v, now, held);
+                no = new_event(&n, v, now, held, 0);
+            }
+            if (ro != no || r.pending != n.pending || r.frac != n.frac || r.last_ms != n.last_ms) {
+                CHECK(0, "run %d op %d: old %d/%d/%d new %d/%d/%d", run, i, ro, r.pending, r.frac,
+                      no, n.pending, n.frac);
+                return;
+            }
+        }
+    }
+    CHECK(1, "smoothing 0 matches the old path");
+}
+
+/* Normal smoothing holds motion back like aim, at full speed, and lets it
+ * all out once the thumb stops. */
+static void test_smooth_normal(void) {
+    struct rip_aim_axis a = {0};
+    uint32_t now = 1000;
+    CHECK(new_event(&a, 10, now, false, 80) == 0 && a.pending == 10000,
+          "first event from rest is held back: pending %d", a.pending);
+    long out = 0;
+    for (int i = 0; i < 200 && !rip_aim_idle(&a); i++) {
+        now += INTERVAL;
+        out += new_work(&a, now, false, 80);
+    }
+    CHECK(out == 10 && rip_aim_idle(&a), "all 10 counts come out: %ld", out);
+
+    /* Steady motion at full speed trails by about speed * tau. */
+    a = (struct rip_aim_axis){0};
+    out = 0;
+    for (int i = 0; i < 50; i++, now += 6) {
+        out += new_event(&a, 2, now, false, TAU);
+    }
+    CHECK(out >= 100 - 25 && out <= 100 - 10, "normal lag: out %ld of 100", out);
+}
+
+/* Switching between aim and normal smoothing neither drops nor repeats what
+ * is held back: everything added (aim input slowed, normal input at full
+ * speed) comes out once both have drained. */
+static void test_smooth_switch_conserves(void) {
+    srand(777);
+    for (int run = 0; run < 300; run++) {
+        struct rip_aim_axis a = {0};
+        uint32_t now = (uint32_t)rand();
+        uint32_t ntau = 1 + (uint32_t)(rand() % RIP_AIM_MAX_SMOOTHING_MS);
+        bool held = rand() % 2;
+        long added = 0;
+        long out = 0;
+        for (int i = 0; i < 200; i++) {
+            if (rand() % 15 == 0) {
+                held = !held;
+            }
+            now += (uint32_t)(rand() % 20);
+            if (rand() % 4 == 0) {
+                if (!rip_aim_idle(&a) && now - a.last_ms >= INTERVAL) {
+                    out += rip_aim_tick(&a, now, rip_smooth_tau(held, TAU, ntau));
+                }
+                continue;
+            }
+            int16_t v = (int16_t)(rand() % 41 - 20);
+            added += (long)v * (held ? PERCENT : 100) * 10;
+            out += rip_smooth_event(&a, v, now, held, PERCENT, TAU, ntau);
+        }
+        held = false;
+        for (int i = 0; i < 400 && !rip_aim_idle(&a); i++) {
+            now += INTERVAL;
+            out += rip_aim_tick(&a, now, rip_smooth_tau(held, TAU, ntau));
+        }
+        if (!rip_aim_idle(&a) || out * 1000 + a.frac != added) {
+            CHECK(0, "run %d: added %ld out %ld frac %d pending %d", run, added, out, a.frac,
+                  a.pending);
+            return;
+        }
+    }
+    CHECK(1, "aim <-> normal switching conserves");
+}
+
+/* Turning normal smoothing off while it holds motion back: later events pass
+ * at once and what was held back still drains (at aim's pace); nothing is
+ * repeated and at most the last sub-count rest is dropped. */
+static void test_smooth_turned_off(void) {
+    struct rip_aim_axis a = {0};
+    uint32_t now = 1000;
+    long added = 0;
+    long out = 0;
+    for (int i = 0; i < 10; i++, now += 6) {
+        added += 7 * 1000;
+        out += rip_smooth_event(&a, 7, now, false, PERCENT, TAU, 120);
+    }
+    CHECK(!rip_aim_idle(&a), "normal smoothing holds some back: pending %d", a.pending);
+    for (int i = 0; i < 10; i++, now += 6) {
+        added += 3 * 1000;
+        out += new_event(&a, 3, now, false, 0);
+    }
+    for (int i = 0; i < 200 && !rip_aim_idle(&a); i++) {
+        now += INTERVAL;
+        out += new_work(&a, now, false, 0);
+    }
+    long diff = added - out * 1000;
+    CHECK(rip_aim_idle(&a) && diff >= 0 && diff < 1000, "turned off: added %ld out %ld", added,
+          out * 1000);
+}
+
 int main(void) {
     test_clamp();
     test_rest();
@@ -277,6 +467,11 @@ int main(void) {
     test_tremor();
     test_release_steps();
     test_int16_limit();
+    test_smooth_tau();
+    test_smooth_off_matches_old();
+    test_smooth_normal();
+    test_smooth_switch_conserves();
+    test_smooth_turned_off();
 
     if (failures) {
         printf("aim_math_test: %d of %d checks FAILED\n", failures, checks);
