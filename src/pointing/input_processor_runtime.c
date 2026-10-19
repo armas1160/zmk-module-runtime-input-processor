@@ -170,6 +170,9 @@ struct runtime_processor_data {
     // what is left once input stops. aim_lock guards aim_axis between the
     // input thread and the work.
     uint8_t aim_hold_count;
+    // Speed of the newest held aim key (10..100), 0 = aim_scale_percent.
+    // Set by the aim behavior, not persisted
+    uint8_t aim_key_percent;
     struct rip_aim_axis aim_axis[2];
     struct k_spinlock aim_lock;
     struct k_work_delayable aim_work;
@@ -988,8 +991,9 @@ static void aim_handle_event(struct runtime_processor_data *data, struct input_e
 
     uint32_t now = (uint32_t)k_uptime_get();
     int16_t value = (int16_t)CLAMP(event->value, INT16_MIN, INT16_MAX);
-    event->value = rip_smooth_event(state, value, now, held, data->aim_scale_percent,
-                                    data->aim_smoothing_ms, data->smoothing_ms);
+    uint8_t aim_percent = rip_aim_effective_percent(data->aim_key_percent, data->aim_scale_percent);
+    event->value = rip_smooth_event(state, value, now, held, aim_percent, data->aim_smoothing_ms,
+                                    data->smoothing_ms);
     bool busy = aim_busy(data);
     k_spin_unlock(&data->aim_lock, key);
 
@@ -1872,6 +1876,7 @@ static int runtime_processor_init(const struct device *dev) {
 
     // Aim mode and click freeze start idle
     data->aim_hold_count = 0;
+    data->aim_key_percent = 0;
     data->aim_axis[0] = (struct rip_aim_axis){0};
     data->aim_axis[1] = (struct rip_aim_axis){0};
     data->click_freeze_until = 0;
@@ -3318,6 +3323,18 @@ void zmk_input_processor_runtime_temp_layer_keep_active(const struct device *dev
     if (!keep_active && data->temp_layer_enabled && data->temp_layer_layer_active) {
         k_work_reschedule(&data->temp_layer_deactivation_work, K_NO_WAIT);
     }
+}
+
+void zmk_input_processor_runtime_set_aim_key_scale(const struct device *dev, uint32_t percent) {
+    if (!dev) {
+        return;
+    }
+
+    struct runtime_processor_data *data = dev->data;
+    // Only scales input from now on: what the filter holds back stays as is
+    k_spinlock_key_t key = k_spin_lock(&data->aim_lock);
+    data->aim_key_percent = rip_aim_key_percent(percent);
+    k_spin_unlock(&data->aim_lock, key);
 }
 
 void zmk_input_processor_runtime_aim(const struct device *dev, bool hold) {

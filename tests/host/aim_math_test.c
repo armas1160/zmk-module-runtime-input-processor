@@ -457,6 +457,100 @@ static void test_smooth_turned_off(void) {
           out * 1000);
 }
 
+/* --- Per-key aim speed (rip_aim_keys_*) --------------------------------- */
+
+static void test_aim_key_percent(void) {
+    CHECK(rip_aim_key_percent(0) == 0, "0 stays default");
+    CHECK(rip_aim_key_percent(1) == 10, "1 clamps to 10");
+    CHECK(rip_aim_key_percent(9) == 10, "9 clamps to 10");
+    CHECK(rip_aim_key_percent(10) == 10, "10");
+    CHECK(rip_aim_key_percent(55) == 55, "55");
+    CHECK(rip_aim_key_percent(100) == 100, "100");
+    CHECK(rip_aim_key_percent(101) == 100, "101 clamps to 100");
+    CHECK(rip_aim_key_percent(4294967295u) == 100, "UINT32_MAX clamps to 100");
+    CHECK(rip_aim_effective_percent(0, 40) == 40, "default uses the processor's speed");
+    CHECK(rip_aim_effective_percent(25, 40) == 25, "a key's own speed wins");
+}
+
+/* The newest held key decides; releasing it falls back to the newest one
+ * still held, whatever order they are released in. */
+static void test_aim_keys_order(void) {
+    struct rip_aim_keys k = {0};
+    CHECK(rip_aim_keys_percent(&k) == 0, "nothing held: default");
+    CHECK(rip_aim_keys_press(&k, 13, 0) && rip_aim_keys_percent(&k) == 0, "F (default)");
+    CHECK(rip_aim_keys_press(&k, 3, 20) && rip_aim_keys_percent(&k) == 20, "R at 20");
+    CHECK(rip_aim_keys_press(&k, 23, 70) && rip_aim_keys_percent(&k) == 70, "V at 70");
+    /* Release the middle one: the newest (V) still decides. */
+    CHECK(rip_aim_keys_release(&k, 3) && rip_aim_keys_percent(&k) == 70, "R up: still 70");
+    /* Release the newest: back to F, the newest still held. */
+    CHECK(rip_aim_keys_release(&k, 23) && rip_aim_keys_percent(&k) == 0, "V up: back to default");
+    CHECK(rip_aim_keys_press(&k, 3, 5) && rip_aim_keys_percent(&k) == 10, "R again at 5 -> 10");
+    CHECK(rip_aim_keys_release(&k, 13) && rip_aim_keys_percent(&k) == 10, "F up: R stays");
+    CHECK(rip_aim_keys_release(&k, 3) && k.count == 0 && rip_aim_keys_percent(&k) == 0,
+          "all up: default");
+
+    /* A release that did not press is ignored and changes nothing. */
+    CHECK(rip_aim_keys_press(&k, 13, 30), "F at 30");
+    CHECK(!rip_aim_keys_release(&k, 14) && k.count == 1 && rip_aim_keys_percent(&k) == 30,
+          "stray release ignored");
+    CHECK(rip_aim_keys_release(&k, 13) && !rip_aim_keys_release(&k, 13) && k.count == 0,
+          "second release of the same key ignored");
+
+    /* Full: the press is refused, so its release is ignored too. */
+    k = (struct rip_aim_keys){0};
+    for (uint32_t p = 0; p < RIP_AIM_KEYS_MAX; p++) {
+        (void)rip_aim_keys_press(&k, p, 10 + p);
+    }
+    CHECK(!rip_aim_keys_press(&k, 99, 50) && rip_aim_keys_percent(&k) == 10 + RIP_AIM_KEYS_MAX - 1,
+          "full: refused");
+    CHECK(!rip_aim_keys_release(&k, 99) && k.count == RIP_AIM_KEYS_MAX, "refused key's release");
+
+    /* The same position twice (e.g. two layers' bindings): the newest goes first. */
+    k = (struct rip_aim_keys){0};
+    (void)rip_aim_keys_press(&k, 13, 20);
+    (void)rip_aim_keys_press(&k, 13, 60);
+    CHECK(rip_aim_keys_release(&k, 13) && rip_aim_keys_percent(&k) == 20, "duplicate: newest out");
+}
+
+/* Changing the speed while aiming (another key pressed or released) only
+ * scales what comes in from then on: nothing held back jumps or is lost. */
+static void test_aim_speed_change_conserves(void) {
+    srand(2468);
+    for (int run = 0; run < 300; run++) {
+        struct rip_aim_axis a = {0};
+        uint32_t now = (uint32_t)rand();
+        uint32_t ntau = (uint32_t)(rand() % 3) * 40;
+        long added = 0;
+        long out = 0;
+        int percent = 40;
+        for (int i = 0; i < 200; i++) {
+            if (rand() % 8 == 0) {
+                percent =
+                    rip_aim_effective_percent(rip_aim_key_percent((uint32_t)(rand() % 110)), 40);
+            }
+            now += (uint32_t)(rand() % 20);
+            if (rand() % 4 == 0) {
+                if (!rip_aim_idle(&a) && now - a.last_ms >= INTERVAL) {
+                    out += rip_aim_tick(&a, now, rip_smooth_tau(true, TAU, ntau));
+                }
+                continue;
+            }
+            int16_t v = (int16_t)(rand() % 41 - 20);
+            added += (long)v * percent * 10;
+            out += rip_smooth_event(&a, v, now, true, percent, TAU, ntau);
+        }
+        for (int i = 0; i < 400 && !rip_aim_idle(&a); i++) {
+            now += INTERVAL;
+            out += rip_aim_tick(&a, now, TAU);
+        }
+        if (!rip_aim_idle(&a) || out * 1000 + a.frac != added) {
+            CHECK(0, "run %d: added %ld out %ld frac %d", run, added, out, a.frac);
+            return;
+        }
+    }
+    CHECK(1, "speed changes while aiming conserve");
+}
+
 int main(void) {
     test_clamp();
     test_rest();
@@ -472,6 +566,9 @@ int main(void) {
     test_smooth_normal();
     test_smooth_switch_conserves();
     test_smooth_turned_off();
+    test_aim_key_percent();
+    test_aim_keys_order();
+    test_aim_speed_change_conserves();
 
     if (failures) {
         printf("aim_math_test: %d of %d checks FAILED\n", failures, checks);

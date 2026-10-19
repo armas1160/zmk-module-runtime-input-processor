@@ -205,3 +205,67 @@ static inline int16_t rip_smooth_event(struct rip_aim_axis *axis, int16_t value,
     }
     return (int16_t)sum;
 }
+
+/*
+ * Aim keys held through one aim behavior, oldest first, each with its own
+ * speed: 0 means the processor's aim speed, 10..100 that key's own. The
+ * newest held key decides the speed; releasing it falls back to the newest
+ * one still held. A release from a position that did not press (a hold-tap
+ * that decided tap at once releases its hold binding without pressing it) is
+ * ignored. The speed only scales input added from then on, so a change while
+ * aiming neither jumps nor drops what the filter holds back.
+ */
+#define RIP_AIM_KEYS_MAX 8
+
+struct rip_aim_keys {
+    uint32_t position[RIP_AIM_KEYS_MAX];
+    uint8_t percent[RIP_AIM_KEYS_MAX];
+    uint8_t count;
+};
+
+/* A key's speed parameter: 0 stays 0 (the processor's aim speed), anything
+ * else is clamped to [RIP_AIM_MIN_PERCENT, RIP_AIM_MAX_PERCENT]. */
+static inline uint8_t rip_aim_key_percent(uint32_t param) {
+    return param == 0 ? 0 : rip_aim_clamp_percent(param);
+}
+
+/* Record a press; false (and nothing recorded) when RIP_AIM_KEYS_MAX keys
+ * are already held, so its release is ignored as well. */
+static inline bool rip_aim_keys_press(struct rip_aim_keys *keys, uint32_t position,
+                                      uint32_t param) {
+    if (keys->count >= RIP_AIM_KEYS_MAX) {
+        return false;
+    }
+    keys->position[keys->count] = position;
+    keys->percent[keys->count] = rip_aim_key_percent(param);
+    keys->count++;
+    return true;
+}
+
+/* Forget the newest press from this position, keeping the order of the
+ * others; false when no held key pressed from there. */
+static inline bool rip_aim_keys_release(struct rip_aim_keys *keys, uint32_t position) {
+    int i = (int)keys->count - 1;
+    while (i >= 0 && keys->position[i] != position) {
+        i--;
+    }
+    if (i < 0) {
+        return false;
+    }
+    for (; i + 1 < (int)keys->count; i++) {
+        keys->position[i] = keys->position[i + 1];
+        keys->percent[i] = keys->percent[i + 1];
+    }
+    keys->count--;
+    return true;
+}
+
+/* The newest held key's speed, 0 (the processor's) when none is held. */
+static inline uint8_t rip_aim_keys_percent(const struct rip_aim_keys *keys) {
+    return keys->count > 0 ? keys->percent[keys->count - 1] : 0;
+}
+
+/* Speed while aiming: the key's own, else the processor's aim speed. */
+static inline uint8_t rip_aim_effective_percent(uint8_t key_percent, uint8_t aim_percent) {
+    return key_percent != 0 ? key_percent : aim_percent;
+}

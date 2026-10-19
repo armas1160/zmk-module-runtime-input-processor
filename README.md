@@ -631,8 +631,22 @@ still there after a long pause.
     aim-smoothing-ms = <50>;
 };
 
-// keymap: &rip_aim on a key of the mouse layer
+// keymap: &rip_aim 0 on a key of the mouse layer
 ```
+
+The behavior's parameter is that key's speed: `0` uses the processor's aim
+speed (`aim-scale-percent`, or its runtime value), `10..100` the key's own
+(other values are clamped, `1..9` to `10`). With several aim keys held, the
+newest one's speed applies; releasing it goes back to the newest one still
+held. The smoothing is shared by all keys. A speed change while aiming only
+scales the input that comes in from then on, so nothing held back jumps or
+is lost. For a key that types when tapped and aims when held, use the aim
+behavior as the hold binding of a hold-tap (`bindings = <&rip_aim>, <&kp>`,
+keymap `&my_ht 25 F`): the hold-tap passes its first parameter to it, and
+its Studio parameter list (Default = 0, Speed % = 10..100) carries over.
+Keymaps saved by Studio while the behavior had no parameter stored 0, so
+they keep the default speed. A release from a position that did not press
+the behavior is ignored.
 
 The filter runs on the final cursor values (after scaling and acceleration),
 per output axis, in integer fixed point (`src/pointing/rip_aim_math.h`).

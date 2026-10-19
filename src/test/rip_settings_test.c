@@ -1633,6 +1633,62 @@ static int test_smoothing(void) {
     return 0;
 }
 
+/* Per-key aim speed: 0 uses the aim scale, others are clamped to 10..100,
+ * and a change while aiming only scales input from then on. */
+static int test_aim_key_scale(void) {
+    const struct device *dev = zmk_input_processor_runtime_find_by_name(TEST_PROCESSOR_NAME);
+    if (!dev) {
+        LOG_ERR("Test processor '%s' not found", TEST_PROCESSOR_NAME);
+        return -ENODEV;
+    }
+
+    int ret;
+    /* Isolate the filter; aim at 50 % without smoothing, normal smoothing off. */
+    if ((ret = zmk_input_processor_runtime_set_rotation(
+             dev, 0, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY)) < 0 ||
+        (ret = zmk_input_processor_runtime_set_tilt(
+             dev, 0, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY)) < 0 ||
+        (ret = zmk_input_processor_runtime_set_scaling(
+             dev, 1, 1, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY)) < 0 ||
+        (ret = zmk_input_processor_runtime_set_accel(
+             dev, 100, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY)) < 0 ||
+        (ret = zmk_input_processor_runtime_set_inertia_enabled(
+             dev, false, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY)) < 0 ||
+        (ret = zmk_input_processor_runtime_set_smoothing(
+             dev, 0, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY)) < 0 ||
+        (ret = zmk_input_processor_runtime_set_aim(
+             dev, 50, 0, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY)) < 0) {
+        return ret;
+    }
+
+    static const struct {
+        uint32_t key;
+        int32_t out;
+    } cases[] = {{0, 5}, {20, 2}, {5, 1}, {250, 10}, {0, 5}};
+    zmk_input_processor_runtime_aim(dev, true);
+    for (size_t i = 0; i < ARRAY_SIZE(cases); i++) {
+        int32_t out;
+        zmk_input_processor_runtime_set_aim_key_scale(dev, cases[i].key);
+        if ((ret = process_test_relative(dev, INPUT_REL_X, 10, &out)) < 0) {
+            break;
+        }
+        if (out != cases[i].out) {
+            LOG_ERR("Aim key speed %u: 10 -> %d expected %d", cases[i].key, out, cases[i].out);
+            ret = -EINVAL;
+            break;
+        }
+    }
+    zmk_input_processor_runtime_set_aim_key_scale(dev, 0);
+    zmk_input_processor_runtime_aim(dev, false);
+    zmk_input_processor_runtime_restore_persistent(dev);
+    if (ret < 0) {
+        return ret;
+    }
+
+    LOG_INF("PASS: rip_aim_key_scale");
+    return 0;
+}
+
 static int rip_settings_test_init(void) {
     int ret = test_settings_backend_init();
     if (ret < 0) {
@@ -1673,6 +1729,11 @@ static int rip_settings_test_init(void) {
     ret = test_smoothing();
     if (ret < 0) {
         LOG_ERR("FAIL: rip_normal_smoothing ret=%d", ret);
+    }
+
+    ret = test_aim_key_scale();
+    if (ret < 0) {
+        LOG_ERR("FAIL: rip_aim_key_scale ret=%d", ret);
     }
     return 0;
 }

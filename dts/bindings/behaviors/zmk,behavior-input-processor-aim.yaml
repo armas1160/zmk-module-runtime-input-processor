@@ -3,13 +3,16 @@
 
 description: |
   Behavior for precise aiming while a key is held: the processor's cursor
-  output is slowed to its aim-scale-percent and smoothed over its
-  aim-smoothing-ms, so a trembling thumb does not shake the cursor. The
-  temp-layer layer stays active while the key is held.
+  output is slowed and smoothed over its aim smoothing, so a trembling thumb
+  does not shake the cursor. The temp-layer layer stays active while the key
+  is held. The parameter is the speed in percent: 0 uses the processor's aim
+  speed (aim-scale-percent or its runtime value), 10..100 this key's own
+  (others are clamped). With several aim keys held, the newest one's speed
+  applies. Usable as the hold binding of a hold-tap (&ht <speed> <key>).
 
 compatible: "zmk,behavior-input-processor-aim"
 
-include: zero_param.yaml
+include: one_param.yaml
 
 
 properties:

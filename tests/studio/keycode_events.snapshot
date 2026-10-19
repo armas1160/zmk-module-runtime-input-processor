@@ -7,3 +7,4 @@ PASS: rip_tilt_compensation
 PASS: rip_pointer_accel
 PASS: rip_aim_settings
 PASS: rip_normal_smoothing
+PASS: rip_aim_key_scale
