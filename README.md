@@ -306,6 +306,7 @@ my_pointer_processor: my_pointer_processor {
     temp-layer = <1>;  // Target layer (default: 0)
     temp-layer-activation-delay-ms = <100>;  // Activation delay (default: 100)
     temp-layer-deactivation-delay-ms = <500>;  // Deactivation delay (default: 500)
+    temp-layer-activation-distance = <8>;  // Motion needed first (default: 0 = any motion)
 };
 ```
 
@@ -325,6 +326,20 @@ Temp-layer layer settings can also be configured through the web interface:
 - When you press any keyboard key, the layer deactivates immediately (unless it's a modifier or the key is on the temp-layer layer)
 - If you stop moving the pointing device, the layer deactivates after the deactivation delay
 - If a key press occurs before the activation delay expires, the layer won't activate
+- With `temp-layer-activation-distance` (default `0` = any motion, clamped to
+  `0..100`), the layer only activates once one motion burst adds up to that
+  many output counts (`|dx| + |dy|` after acceleration and scaling, about
+  cursor pixels), so vibration or a hand brushing the ball does not switch
+  layers. A pause of more than 150 ms, a key press or the layer activating or
+  deactivating starts the count over. The count is taken before aim and
+  smoothing (aim does not make the layer harder to reach, smoothing does not
+  delay it); motion that aim, smoothing or inertia release later does not
+  count. It follows the same write modes as the other settings and is saved
+  with them (settings blob version 8; older records load with the devicetree
+  default). Over Studio RPC it is `SetTempLayerActivationDistanceRequest` and
+  the `temp_layer_activation_distance` and `activation_distance_supported`
+  fields of `InputProcessorInfo`; the firmware API is
+  `zmk_input_processor_runtime_set_temp_layer_activation_distance()`
 - With `temp-layer-extend-on-other-input`, input the processor does not handle
   itself (such as motion that a scroll processor earlier in the same listener
   already turned into scroll, on a scroll layer reached from the temp layer)

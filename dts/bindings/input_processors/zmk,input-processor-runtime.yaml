@@ -175,6 +175,18 @@ properties:
     default: 500
     description: Default delay before deactivating temp-layer layer after input stops (milliseconds)
 
+  temp-layer-activation-distance:
+    type: int
+    default: 0
+    description: |
+      Default motion needed before the temp-layer layer activates: the output
+      counts of one motion burst (|dx| + |dy| after scaling, about cursor
+      pixels), so vibration or brushing the ball does not activate it. A pause
+      of more than 150 ms, a key press or the layer switching starts the count
+      over. 0 activates on any motion (the behavior without it). Clamped to
+      0..100. Runtime-settable (SetTempLayerActivationDistanceRequest) and
+      persisted; this is the default.
+
   temp-layer-extend-on-other-input:
     type: boolean
     description: |

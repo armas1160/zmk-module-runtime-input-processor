@@ -81,6 +81,8 @@ handle_set_temp_layer_activation_delay(const cormoran_rip_SetTempLayerActivation
                                        cormoran_rip_Response *resp);
 static int handle_set_temp_layer_deactivation_delay(
     const cormoran_rip_SetTempLayerDeactivationDelayRequest *req, cormoran_rip_Response *resp);
+static int handle_set_temp_layer_activation_distance(
+    const cormoran_rip_SetTempLayerActivationDistanceRequest *req, cormoran_rip_Response *resp);
 static int handle_set_active_layers(const cormoran_rip_SetActiveLayersRequest *req,
                                     cormoran_rip_Response *resp);
 static int handle_get_layer_info(const cormoran_rip_GetLayerInfoRequest *req,
@@ -206,6 +208,10 @@ static bool rip_rpc_handle_request(const zmk_custom_CallRequest *raw_request,
     case cormoran_rip_Request_set_temp_layer_deactivation_delay_tag:
         rc = handle_set_temp_layer_deactivation_delay(
             &req.request_type.set_temp_layer_deactivation_delay, resp);
+        break;
+    case cormoran_rip_Request_set_temp_layer_activation_distance_tag:
+        rc = handle_set_temp_layer_activation_distance(
+            &req.request_type.set_temp_layer_activation_distance, resp);
         break;
     case cormoran_rip_Request_set_active_layers_tag:
         rc = handle_set_active_layers(&req.request_type.set_active_layers, resp);
@@ -392,6 +398,8 @@ static int handle_get_input_processor(const cormoran_rip_GetInputProcessorReques
     result.processor.temp_layer_layer = config.temp_layer_layer;
     result.processor.temp_layer_activation_delay_ms = config.temp_layer_activation_delay_ms;
     result.processor.temp_layer_deactivation_delay_ms = config.temp_layer_deactivation_delay_ms;
+    result.processor.temp_layer_activation_distance = config.temp_layer_activation_distance;
+    result.processor.activation_distance_supported = true;
     result.processor.active_layers = config.active_layers;
     result.processor.axis_snap_mode = (cormoran_rip_AxisSnapMode)config.axis_snap_mode;
     result.processor.axis_snap_threshold = config.axis_snap_threshold;
@@ -803,6 +811,36 @@ static int handle_set_temp_layer_deactivation_delay(
     resp->response_type.set_temp_layer_deactivation_delay =
         (cormoran_rip_SetTempLayerDeactivationDelayResponse)
             cormoran_rip_SetTempLayerDeactivationDelayResponse_init_zero;
+
+    return 0;
+}
+
+/**
+ * Handle setting temp-layer activation distance (clamped to 0..100, 0 = any motion)
+ */
+static int handle_set_temp_layer_activation_distance(
+    const cormoran_rip_SetTempLayerActivationDistanceRequest *req, cormoran_rip_Response *resp) {
+    LOG_DBG("Setting temp-layer activation distance for id=%d to %u", req->id, req->value);
+
+    const struct device *dev = zmk_input_processor_runtime_find_by_id(req->id);
+    if (!dev) {
+        LOG_WRN("Input processor not found: id=%d", req->id);
+        return -ENODEV;
+    }
+
+    // Set temp-layer activation distance (write mode per request)
+    int ret = zmk_input_processor_runtime_set_temp_layer_activation_distance(
+        dev, req->value, rip_write_mode(req->write_mode));
+    if (ret < 0) {
+        LOG_ERR("Failed to set temp-layer activation distance: %d", ret);
+        return ret;
+    }
+
+    // Return empty response
+    resp->which_response_type = cormoran_rip_Response_set_temp_layer_activation_distance_tag;
+    resp->response_type.set_temp_layer_activation_distance =
+        (cormoran_rip_SetTempLayerActivationDistanceResponse)
+            cormoran_rip_SetTempLayerActivationDistanceResponse_init_zero;
 
     return 0;
 }

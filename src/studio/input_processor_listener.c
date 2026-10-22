@@ -90,6 +90,8 @@ static int input_processor_state_changed_listener(const zmk_event_t *eh) {
     info->temp_layer_layer = ev->config.temp_layer_layer;
     info->temp_layer_activation_delay_ms = ev->config.temp_layer_activation_delay_ms;
     info->temp_layer_deactivation_delay_ms = ev->config.temp_layer_deactivation_delay_ms;
+    info->temp_layer_activation_distance = ev->config.temp_layer_activation_distance;
+    info->activation_distance_supported = true;
     info->active_layers = ev->config.active_layers;
     info->axis_snap_mode = ev->config.axis_snap_mode;
     info->axis_snap_threshold = ev->config.axis_snap_threshold;

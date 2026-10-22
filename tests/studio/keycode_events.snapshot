@@ -8,3 +8,4 @@ PASS: rip_pointer_accel
 PASS: rip_aim_settings
 PASS: rip_normal_smoothing
 PASS: rip_aim_key_scale
+PASS: rip_temp_layer_activation_distance

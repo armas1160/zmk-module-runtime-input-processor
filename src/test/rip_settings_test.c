@@ -1689,6 +1689,107 @@ static int test_aim_key_scale(void) {
     return 0;
 }
 
+static int check_activation_distance(const struct device *dev, uint8_t distance, const char *what) {
+    struct zmk_input_processor_runtime_config cfg;
+    int ret = zmk_input_processor_runtime_get_config(dev, NULL, &cfg);
+    if (ret < 0) {
+        return ret;
+    }
+    if (cfg.temp_layer_activation_distance != distance) {
+        LOG_ERR("%s: activation distance %u expected %u", what, cfg.temp_layer_activation_distance,
+                distance);
+        return -EINVAL;
+    }
+    return 0;
+}
+
+/* Temp-layer activation distance: clamping, write modes, v8 persistence and
+ * the v7 upgrade. test.dtsi sets no temp-layer-activation-distance, so the
+ * devicetree default is 0. The counting itself is tested on the host
+ * (tests/host/temp_layer_math_test.c). */
+static int test_activation_distance(void) {
+    const struct device *dev = zmk_input_processor_runtime_find_by_name(TEST_PROCESSOR_NAME);
+    if (!dev) {
+        LOG_ERR("Test processor '%s' not found", TEST_PROCESSOR_NAME);
+        return -ENODEV;
+    }
+
+    struct zmk_input_processor_runtime_config cfg;
+    int ret;
+
+    if ((ret = check_activation_distance(dev, 0, "Activation distance default")) < 0) {
+        return ret;
+    }
+
+    /* Out-of-range requests are clamped, not rejected. */
+    static const struct {
+        uint32_t in;
+        uint8_t out;
+    } distance_cases[] = {{300, 100}, {0, 0}, {8, 8}};
+    for (size_t i = 0; i < ARRAY_SIZE(distance_cases); i++) {
+        if ((ret = zmk_input_processor_runtime_set_temp_layer_activation_distance(
+                 dev, distance_cases[i].in, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_MEMORY)) < 0 ||
+            (ret = check_activation_distance(dev, distance_cases[i].out,
+                                             "Activation distance clamp")) < 0) {
+            return ret;
+        }
+    }
+
+    /* A temporary change leaves the saved value alone. */
+    if ((ret = zmk_input_processor_runtime_set_temp_layer_activation_distance(
+             dev, 20, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY)) < 0 ||
+        (ret = check_activation_distance(dev, 8, "Activation distance temporary")) < 0) {
+        return ret;
+    }
+    zmk_input_processor_runtime_restore_persistent(dev);
+
+    /* v8 persistence round trip; reset restores the devicetree default. */
+    ret = zmk_input_processor_runtime_set_temp_layer_activation_distance(
+        dev, 12, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_PERSIST);
+    if (ret < 0) {
+        return ret;
+    }
+    zmk_input_processor_runtime_test_flush_save(dev);
+    zmk_input_processor_runtime_reset(dev);
+    if ((ret = check_activation_distance(dev, 0, "Activation distance reset")) < 0) {
+        return ret;
+    }
+    ret = settings_load_subtree("custom_settings");
+    if (ret < 0) {
+        return ret;
+    }
+    zmk_input_processor_runtime_test_apply_persisted_settings();
+    if ((ret = check_activation_distance(dev, 12, "Activation distance persisted")) < 0) {
+        return ret;
+    }
+
+    /* A memory-only change is dropped by discard. */
+    if ((ret = zmk_input_processor_runtime_set_temp_layer_activation_distance(
+             dev, 30, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_MEMORY)) < 0 ||
+        (ret = zmk_input_processor_runtime_discard_all()) < 0 ||
+        (ret = check_activation_distance(dev, 12, "Activation distance discard")) < 0) {
+        return ret;
+    }
+
+    /* A v7 record (no activation distance) keeps its own values, normal
+     * smoothing included, and takes the devicetree default. */
+    if ((ret = zmk_input_processor_runtime_set_smoothing(
+             dev, 40, ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_MEMORY)) < 0 ||
+        (ret = zmk_input_processor_runtime_test_apply_legacy_v7(dev)) < 0) {
+        return ret;
+    }
+    zmk_input_processor_runtime_get_config(dev, NULL, &cfg);
+    if (cfg.rotation_degrees != 48 || cfg.smoothing_ms != 40 ||
+        cfg.temp_layer_activation_distance != 0) {
+        LOG_ERR("Legacy v7 settings were not migrated: rot=%d smoothing=%u ms distance=%u",
+                cfg.rotation_degrees, cfg.smoothing_ms, cfg.temp_layer_activation_distance);
+        return -EINVAL;
+    }
+
+    LOG_INF("PASS: rip_temp_layer_activation_distance");
+    return 0;
+}
+
 static int rip_settings_test_init(void) {
     int ret = test_settings_backend_init();
     if (ret < 0) {
@@ -1734,6 +1835,11 @@ static int rip_settings_test_init(void) {
     ret = test_aim_key_scale();
     if (ret < 0) {
         LOG_ERR("FAIL: rip_aim_key_scale ret=%d", ret);
+    }
+
+    ret = test_activation_distance();
+    if (ret < 0) {
+        LOG_ERR("FAIL: rip_temp_layer_activation_distance ret=%d", ret);
     }
     return 0;
 }

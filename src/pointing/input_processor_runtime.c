@@ -33,6 +33,7 @@
 
 #include "rip_accel_math.h"
 #include "rip_aim_math.h"
+#include "rip_temp_layer_math.h"
 #include "rip_tilt_math.h"
 
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
@@ -75,6 +76,8 @@ struct runtime_processor_config {
     uint8_t initial_temp_layer_layer;
     uint16_t initial_temp_layer_activation_delay_ms;
     uint16_t initial_temp_layer_deactivation_delay_ms;
+    // Kept raw and clamped when applied (see rip_temp_layer_math.h)
+    uint32_t initial_temp_layer_activation_distance;
     // Active layers bitmask from DT
     uint32_t initial_active_layers;
     // Axis snap default settings from DT
@@ -186,12 +189,14 @@ struct runtime_processor_data {
     uint8_t temp_layer_layer;
     uint16_t temp_layer_activation_delay_ms;
     uint16_t temp_layer_deactivation_delay_ms;
+    uint8_t temp_layer_activation_distance; // [0, RIP_TEMP_LAYER_MAX_ACTIVATION_DISTANCE]
 
     // Persistent temp-layer settings
     bool persistent_temp_layer_enabled;
     uint8_t persistent_temp_layer_layer;
     uint16_t persistent_temp_layer_activation_delay_ms;
     uint16_t persistent_temp_layer_deactivation_delay_ms;
+    uint8_t persistent_temp_layer_activation_distance;
 
     // Active layers bitmask (0 = all layers)
     uint32_t active_layers;
@@ -273,6 +278,9 @@ struct runtime_processor_data {
     bool temp_layer_keep_active; // Set by behavior to prevent deactivation
     int64_t last_input_timestamp;
     int64_t last_keypress_timestamp;
+    // Output motion counted toward the activation distance (input thread;
+    // the work handlers and key listeners only reset it)
+    struct rip_temp_layer_distance temp_layer_distance;
 };
 
 /* Recompute the combined rotation + tilt matrix. Call whenever rotation, tilt
@@ -307,6 +315,7 @@ static void temp_layer_activation_work_handler(struct k_work *work) {
     int ret = zmk_keymap_layer_activate(data->temp_layer_layer, false);
     if (ret == 0) {
         data->temp_layer_layer_active = true;
+        rip_temp_layer_distance_reset(&data->temp_layer_distance);
         LOG_INF("Temp-layer layer %d activated", data->temp_layer_layer);
     } else {
         LOG_ERR("Failed to activate temp-layer layer %d: %d", data->temp_layer_layer, ret);
@@ -328,6 +337,7 @@ static void temp_layer_deactivation_work_handler(struct k_work *work) {
     int ret = zmk_keymap_layer_deactivate(data->temp_layer_layer, false);
     if (ret == 0) {
         data->temp_layer_layer_active = false;
+        rip_temp_layer_distance_reset(&data->temp_layer_distance);
         LOG_INF("Temp-layer layer %d deactivated", data->temp_layer_layer);
     } else {
         LOG_ERR("Failed to deactivate temp-layer layer %d: %d", data->temp_layer_layer, ret);
@@ -1023,6 +1033,30 @@ static void temp_layer_extend_on_other_input(const struct runtime_processor_conf
                       K_MSEC(data->temp_layer_deactivation_delay_ms));
 }
 
+/* Temp-layer activation with an activation distance (see
+ * rip_temp_layer_math.h): one event's output after acceleration and scaling,
+ * before aim and smoothing, so it is about cursor pixels, AIM's slowdown does
+ * not make the layer harder to reach and smoothing does not delay it. The
+ * motion that aim, smoothing and inertia release later goes straight to the
+ * HID report and never counts. The layer activates once the burst has reached
+ * the distance and no key was pressed within the activation delay. */
+static void temp_layer_count_distance(struct runtime_processor_data *data, int32_t value) {
+    if (!data->temp_layer_enabled || data->temp_layer_activation_distance == 0 ||
+        data->temp_layer_layer_active || value == 0) {
+        return;
+    }
+
+    int64_t now = k_uptime_get();
+    if (!rip_temp_layer_distance_add(&data->temp_layer_distance, value, (uint32_t)now,
+                                     data->temp_layer_activation_distance)) {
+        return;
+    }
+    if (data->last_keypress_timestamp == 0 ||
+        (now - data->last_keypress_timestamp) >= data->temp_layer_activation_delay_ms) {
+        k_work_reschedule(&data->temp_layer_activation_work, K_NO_WAIT);
+    }
+}
+
 static int runtime_processor_handle_event(const struct device *dev, struct input_event *event,
                                           uint32_t param1, uint32_t param2,
                                           struct zmk_input_processor_state *state) {
@@ -1090,13 +1124,14 @@ static int runtime_processor_handle_event(const struct device *dev, struct input
         }
     }
 
-    // Handle temp-layer layer activation
+    // Handle temp-layer layer activation (with an activation distance it is
+    // checked after scaling instead, see temp_layer_count_distance)
     if (data->temp_layer_enabled && event->value != 0) {
         int64_t now = k_uptime_get();
         data->last_input_timestamp = now;
 
         // Check if we should activate the layer
-        if (!data->temp_layer_layer_active) {
+        if (!data->temp_layer_layer_active && data->temp_layer_activation_distance == 0) {
             // Only activate if no key press within activation delay window
             if (data->last_keypress_timestamp == 0 ||
                 (now - data->last_keypress_timestamp) >= data->temp_layer_activation_delay_ms) {
@@ -1236,6 +1271,8 @@ static int runtime_processor_handle_event(const struct device *dev, struct input
         value = event->value;
     }
 
+    temp_layer_count_distance(data, event->value);
+
     // No inertia while aiming: it would measure the speed before the slowdown
     // and glide past the target (aim press also stops a running glide)
     if (data->aim_hold_count == 0) {
@@ -1283,7 +1320,7 @@ static struct zmk_input_processor_driver_api runtime_processor_driver_api = {
  * see the load path below), so the generic surface is for visibility/inspection.
  */
 #define RIP_SETTINGS_SUBSYSTEM_ID "cormoran_rip"
-#define RIP_SETTINGS_BLOB_VERSION 7
+#define RIP_SETTINGS_BLOB_VERSION 8
 
 /*
  * The persisted-on-flash v1 struct for one processor's original 15 settings
@@ -1394,7 +1431,14 @@ struct rip_persist_v7 {
     uint8_t smoothing_ms;
 } __packed;
 
-#define RIP_SETTINGS_BLOB_SIZE (1 + sizeof(struct rip_persist_v7))
+/* v8 adds the temp layer's activation distance: v7 and one byte, so a v7
+ * record is the start of a v8 one. 1 + sizeof(v8) is 54 bytes, leaving 10. */
+struct rip_persist_v8 {
+    struct rip_persist_v7 v7;
+    uint8_t temp_layer_activation_distance;
+} __packed;
+
+#define RIP_SETTINGS_BLOB_SIZE (1 + sizeof(struct rip_persist_v8))
 
 /* The entry below is a plain ZMK_CUSTOM_SETTING_DEFINE BYTES setting, whose
  * value holds at most CONFIG_ZMK_CUSTOM_SETTINGS_VALUE_MAX_SIZE bytes; the
@@ -1421,7 +1465,7 @@ BUILD_ASSERT(RIP_SETTINGS_BLOB_SIZE <= CONFIG_ZMK_CUSTOM_SETTINGS_VALUE_MAX_SIZE
  * and returns the number of bytes written. Version byte is written separately
  * from the struct memcpy so no wrapper-struct padding enters the layout. */
 static size_t pack_processor_settings(const struct runtime_processor_data *data, uint8_t *buf) {
-    struct rip_persist_v7 settings = {
+    struct rip_persist_v7 v7 = {
         .v6 = {
             .scale_multiplier = data->persistent_scale_multiplier,
             .scale_divisor = data->persistent_scale_divisor,
@@ -1454,14 +1498,19 @@ static size_t pack_processor_settings(const struct runtime_processor_data *data,
         },
         .smoothing_ms = data->persistent_smoothing_ms,
     };
+    struct rip_persist_v8 settings = {
+        .v7 = v7,
+        .temp_layer_activation_distance = data->persistent_temp_layer_activation_distance,
+    };
     buf[0] = RIP_SETTINGS_BLOB_VERSION;
     memcpy(&buf[1], &settings, sizeof(settings));
     return RIP_SETTINGS_BLOB_SIZE;
 }
 
 /* v1 has no inertia fields; start from the current devicetree defaults.
- * v1-v3 have no tilt fields, v1-v4 no acceleration field, v1-v5 no aim fields
- * and v1-v6 no normal smoothing; those take the devicetree defaults. */
+ * v1-v3 have no tilt fields, v1-v4 no acceleration field, v1-v5 no aim fields,
+ * v1-v6 no normal smoothing and v1-v7 no activation distance; those take the
+ * devicetree defaults. */
 static int unpack_and_apply_processor_settings(struct runtime_processor_data *data,
                                                const uint8_t *buf, size_t len) {
     const struct runtime_processor_config *cfg = data->dev->config;
@@ -1473,6 +1522,8 @@ static int unpack_and_apply_processor_settings(struct runtime_processor_data *da
     uint8_t aim_scale_percent = rip_aim_clamp_percent(cfg->initial_aim_scale_percent);
     uint8_t aim_smoothing_ms = rip_aim_clamp_smoothing_ms(cfg->initial_aim_smoothing_ms);
     uint8_t smoothing_ms = rip_aim_clamp_smoothing_ms(cfg->initial_smoothing_ms);
+    uint8_t activation_distance =
+        rip_temp_layer_clamp_distance(cfg->initial_temp_layer_activation_distance);
     if (len == 1 + sizeof(struct rip_persist_v1) && buf[0] == 1) {
         memcpy(&settings.v1, &buf[1], sizeof(settings.v1));
         settings.inertia_enabled = data->persistent_inertia_enabled;
@@ -1505,14 +1556,19 @@ static int unpack_and_apply_processor_settings(struct runtime_processor_data *da
         tilt_axis_degrees = saved.v4.tilt_axis_degrees;
         accel_min_percent = saved.accel_min_percent;
     } else if ((len == 1 + sizeof(struct rip_persist_v6) && buf[0] == 6) ||
+               (len == 1 + sizeof(struct rip_persist_v7) && buf[0] == 7) ||
                (len == RIP_SETTINGS_BLOB_SIZE && buf[0] == RIP_SETTINGS_BLOB_VERSION)) {
-        // v6 is the start of v7; only v7 has the normal smoothing byte
-        struct rip_persist_v7 saved7;
-        memcpy(&saved7, &buf[1], len - 1);
-        if (buf[0] == RIP_SETTINGS_BLOB_VERSION) {
-            smoothing_ms = saved7.smoothing_ms;
+        // v6 is the start of v7 and v7 the start of v8; v7 and v8 have the
+        // normal smoothing byte, only v8 the activation distance
+        struct rip_persist_v8 saved8;
+        memcpy(&saved8, &buf[1], len - 1);
+        if (buf[0] >= 7) {
+            smoothing_ms = saved8.v7.smoothing_ms;
         }
-        struct rip_persist_v6 saved = saved7.v6;
+        if (buf[0] == RIP_SETTINGS_BLOB_VERSION) {
+            activation_distance = saved8.temp_layer_activation_distance;
+        }
+        struct rip_persist_v6 saved = saved8.v7.v6;
         settings.v1 = (struct rip_persist_v1){
             .scale_multiplier = saved.scale_multiplier,
             .scale_divisor = saved.scale_divisor,
@@ -1565,6 +1621,9 @@ static int unpack_and_apply_processor_settings(struct runtime_processor_data *da
         aim_smoothing_ms > RIP_AIM_MAX_SMOOTHING_MS || smoothing_ms > RIP_AIM_MAX_SMOOTHING_MS) {
         return -EINVAL;
     }
+    if (activation_distance > RIP_TEMP_LAYER_MAX_ACTIVATION_DISTANCE) {
+        return -EINVAL;
+    }
 
     const struct rip_persist_v1 *v1 = &settings.v1;
     data->persistent_scale_multiplier = data->scale_multiplier = v1->scale_multiplier;
@@ -1583,6 +1642,8 @@ static int unpack_and_apply_processor_settings(struct runtime_processor_data *da
         v1->temp_layer_activation_delay_ms;
     data->persistent_temp_layer_deactivation_delay_ms = data->temp_layer_deactivation_delay_ms =
         v1->temp_layer_deactivation_delay_ms;
+    data->persistent_temp_layer_activation_distance = data->temp_layer_activation_distance =
+        activation_distance;
     data->persistent_active_layers = data->active_layers = v1->active_layers;
     data->persistent_axis_snap_mode = data->axis_snap_mode = v1->axis_snap_mode;
     data->persistent_axis_snap_threshold = data->axis_snap_threshold = v1->axis_snap_threshold;
@@ -1718,6 +1779,21 @@ int zmk_input_processor_runtime_test_apply_legacy_v6(const struct device *dev) {
     return unpack_and_apply_processor_settings(data, blob, sizeof(blob));
 }
 
+int zmk_input_processor_runtime_test_apply_legacy_v7(const struct device *dev) {
+    if (!dev) {
+        return -EINVAL;
+    }
+    struct runtime_processor_data *data = dev->data;
+    uint8_t current[RIP_SETTINGS_BLOB_SIZE];
+    pack_processor_settings(data, current);
+    struct rip_persist_v8 settings;
+    memcpy(&settings, &current[1], sizeof(settings));
+    settings.v7.v6.rotation_degrees = 48;
+    uint8_t blob[1 + sizeof(settings.v7)] = {7};
+    memcpy(&blob[1], &settings.v7, sizeof(settings.v7));
+    return unpack_and_apply_processor_settings(data, blob, sizeof(blob));
+}
+
 int zmk_input_processor_runtime_test_apply_legacy_v5(const struct device *dev) {
     if (!dev) {
         return -EINVAL;
@@ -1810,12 +1886,16 @@ static int runtime_processor_init(const struct device *dev) {
     data->persistent_temp_layer_activation_delay_ms = cfg->initial_temp_layer_activation_delay_ms;
     data->persistent_temp_layer_deactivation_delay_ms =
         cfg->initial_temp_layer_deactivation_delay_ms;
+    data->temp_layer_activation_distance =
+        rip_temp_layer_clamp_distance(cfg->initial_temp_layer_activation_distance);
+    data->persistent_temp_layer_activation_distance = data->temp_layer_activation_distance;
 
     // Initialize temp-layer runtime state
     data->temp_layer_layer_active = false;
     data->temp_layer_keep_active = false;
     data->last_input_timestamp = 0;
     data->last_keypress_timestamp = 0;
+    data->temp_layer_distance = (struct rip_temp_layer_distance){0};
 
     // Initialize active layers from DT defaults
     data->active_layers = cfg->initial_active_layers;
@@ -1989,6 +2069,9 @@ static void load_processor_defaults(const struct device *dev) {
     data->persistent_temp_layer_activation_delay_ms = cfg->initial_temp_layer_activation_delay_ms;
     data->persistent_temp_layer_deactivation_delay_ms =
         cfg->initial_temp_layer_deactivation_delay_ms;
+    data->temp_layer_activation_distance =
+        rip_temp_layer_clamp_distance(cfg->initial_temp_layer_activation_distance);
+    data->persistent_temp_layer_activation_distance = data->temp_layer_activation_distance;
 
     data->active_layers = cfg->initial_active_layers;
     data->persistent_active_layers = cfg->initial_active_layers;
@@ -1997,6 +2080,7 @@ static void load_processor_defaults(const struct device *dev) {
     if (data->temp_layer_layer_active) {
         zmk_keymap_layer_deactivate(data->temp_layer_layer, false);
         data->temp_layer_layer_active = false;
+        rip_temp_layer_distance_reset(&data->temp_layer_distance);
     }
 
     // Reset axis snap settings to defaults
@@ -2229,6 +2313,7 @@ void zmk_input_processor_runtime_restore_persistent(const struct device *dev) {
     data->aim_scale_percent = data->persistent_aim_scale_percent;
     data->aim_smoothing_ms = data->persistent_aim_smoothing_ms;
     data->smoothing_ms = data->persistent_smoothing_ms;
+    data->temp_layer_activation_distance = data->persistent_temp_layer_activation_distance;
 
     // Restore axis snap settings
     data->axis_snap_mode = data->persistent_axis_snap_mode;
@@ -2287,6 +2372,7 @@ int zmk_input_processor_runtime_get_config(const struct device *dev, const char 
         config->temp_layer_activation_delay_ms = data->persistent_temp_layer_activation_delay_ms;
         config->temp_layer_deactivation_delay_ms =
             data->persistent_temp_layer_deactivation_delay_ms;
+        config->temp_layer_activation_distance = data->persistent_temp_layer_activation_distance;
         config->active_layers = data->persistent_active_layers;
         config->axis_snap_mode = data->persistent_axis_snap_mode;
         config->axis_snap_threshold = data->persistent_axis_snap_threshold;
@@ -2367,6 +2453,8 @@ int zmk_input_processor_runtime_get_config(const struct device *dev, const char 
             DT_INST_PROP_OR(n, temp_layer_activation_delay_ms, 100),                               \
         .initial_temp_layer_deactivation_delay_ms =                                                \
             DT_INST_PROP_OR(n, temp_layer_deactivation_delay_ms, 500),                             \
+        .initial_temp_layer_activation_distance =                                                  \
+            DT_INST_PROP_OR(n, temp_layer_activation_distance, 0),                                 \
         .initial_active_layers = DT_INST_PROP_OR(n, active_layers, 0),                             \
         .initial_axis_snap_mode = DT_INST_PROP_OR(n, axis_snap_mode, 0),                           \
         .initial_axis_snap_threshold = DT_INST_PROP_OR(n, axis_snap_threshold, 100),               \
@@ -2657,6 +2745,8 @@ static int keycode_state_changed_listener(const zmk_event_t *eh) {
         const struct device *dev = runtime_processors[i];
         struct runtime_processor_data *data = dev->data;
         data->last_keypress_timestamp = now;
+        // Motion counted toward the activation distance starts over
+        rip_temp_layer_distance_reset(&data->temp_layer_distance);
     }
 
     return ZMK_EV_EVENT_BUBBLE;
@@ -2802,6 +2892,7 @@ static int position_state_changed_listener(const zmk_event_t *eh) {
         int ret = zmk_keymap_layer_deactivate(data->temp_layer_layer, false);
         if (ret == 0) {
             data->temp_layer_layer_active = false;
+            rip_temp_layer_distance_reset(&data->temp_layer_distance);
             LOG_INF("Temp-layer layer %d deactivated by key press", data->temp_layer_layer);
         }
     }
@@ -2992,6 +3083,26 @@ int zmk_input_processor_runtime_set_temp_layer_deactivation_delay(
     }
 
     LOG_INF("Temp-layer deactivation delay: %dms%s", deactivation_delay_ms, write_mode_label(mode));
+
+    return commit_write(dev, mode);
+}
+
+int zmk_input_processor_runtime_set_temp_layer_activation_distance(
+    const struct device *dev, uint32_t distance, enum zmk_input_processor_runtime_write_mode mode) {
+    if (!dev) {
+        return -EINVAL;
+    }
+
+    struct runtime_processor_data *data = dev->data;
+    // One byte, read by the input thread: the next event counts against it
+    uint8_t value = rip_temp_layer_clamp_distance(distance);
+    data->temp_layer_activation_distance = value;
+
+    if (mode != ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY) {
+        data->persistent_temp_layer_activation_distance = value;
+    }
+
+    LOG_INF("Temp-layer activation distance: %u%s", value, write_mode_label(mode));
 
     return commit_write(dev, mode);
 }

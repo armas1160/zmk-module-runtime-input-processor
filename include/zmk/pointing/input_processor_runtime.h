@@ -54,6 +54,9 @@ struct zmk_input_processor_runtime_config {
     uint8_t temp_layer_layer;
     uint16_t temp_layer_activation_delay_ms;
     uint16_t temp_layer_deactivation_delay_ms;
+    // Motion (|dx| + |dy| after scaling, 0..100) needed before the temp layer
+    // activates; 0 = any motion
+    uint8_t temp_layer_activation_distance;
     // Active layers bitmask (0 = all layers, otherwise each bit represents a layer)
     uint32_t active_layers;
     // Axis snap settings
@@ -341,6 +344,23 @@ int zmk_input_processor_runtime_set_temp_layer_deactivation_delay(
     enum zmk_input_processor_runtime_write_mode mode);
 
 /**
+ * @brief Set temp-layer activation distance
+ *
+ * The layer activates only once the motion of one burst adds up to this many
+ * output counts (|dx| + |dy| after scaling, about cursor pixels; a pause of
+ * more than 150 ms, a key press or the layer switching starts the count over),
+ * in addition to the activation delay. 0 activates on any motion, as before.
+ * The devicetree temp-layer-activation-distance is the default.
+ *
+ * @param dev Pointer to the device structure
+ * @param distance Output counts; clamped to 0..100 (0 = any motion)
+ * @param mode Where to store the value (persist to flash, memory-only, or temporary)
+ * @return 0 on success, negative error code on failure
+ */
+int zmk_input_processor_runtime_set_temp_layer_activation_distance(
+    const struct device *dev, uint32_t distance, enum zmk_input_processor_runtime_write_mode mode);
+
+/**
  * @brief Set active layers bitmask
  *
  * @param dev Pointer to the device structure
@@ -580,6 +600,9 @@ int zmk_input_processor_runtime_test_apply_legacy_v5(const struct device *dev);
 
 /** @brief Test-only: apply a v6 blob (rotation 47) without normal smoothing. */
 int zmk_input_processor_runtime_test_apply_legacy_v6(const struct device *dev);
+
+/** @brief Test-only: apply a v7 blob (rotation 48) without the activation distance. */
+int zmk_input_processor_runtime_test_apply_legacy_v7(const struct device *dev);
 
 /** @brief Test-only: verify timed report splitting and rolling expiration. */
 int zmk_input_processor_runtime_test_inertia_sliding_window(void);
