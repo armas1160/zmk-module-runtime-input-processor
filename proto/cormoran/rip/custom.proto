@@ -404,8 +404,8 @@ message SetGestureRequest {
 message SetGestureResponse {}
 
 // Gesture test mode (RAM only): flicks send GestureFiredNotification instead of
-// their keycodes. It ends by itself about a minute after the last request with
-// enabled = true, so clients renew it while they show the test.
+// their keycodes. It ends by itself 20 s after the last request with
+// enabled = true, so clients renew it (every few seconds) while they show the test.
 message SetGestureTestRequest {
     uint32 id = 1;
     bool enabled = 2;

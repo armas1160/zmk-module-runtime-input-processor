@@ -754,7 +754,7 @@ second custom-settings entry per processor (`<processor-label>_gesture`), so
 the main settings blob keeps its layout. Over Studio RPC it is
 `SetGestureRequest` (all four keycodes, distance and still time at once) and
 the `gesture_*` fields of `InputProcessorInfo`. `SetGestureTestRequest` turns
-on a test mode for about a minute (clients renew it): flicks then send a
+on a test mode for 20 s (clients renew it): flicks then send a
 `GestureFiredNotification` instead of their keycodes. The firmware API is
 `zmk_input_processor_runtime_set_gesture()`,
 `zmk_input_processor_runtime_set_gesture_test()` and

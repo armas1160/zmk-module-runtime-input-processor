@@ -478,8 +478,8 @@ int zmk_input_processor_runtime_set_gesture(
  * @brief Turn gesture test mode on or off (RAM only)
  *
  * In test mode a flick raises zmk_input_processor_gesture_fired (Studio shows
- * it) instead of tapping its keycode. It ends by itself about a minute after
- * the last request, so a client that goes away does not leave gestures off.
+ * it) instead of tapping its keycode. It ends by itself 20 s after the last
+ * request, so a client that goes away does not leave gestures off for long.
  *
  * @param dev Pointer to the device structure
  * @param enabled true to start (or extend) test mode, false to end it
