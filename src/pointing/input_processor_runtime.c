@@ -132,9 +132,9 @@ struct runtime_processor_config {
 BUILD_ASSERT(GESTURE_WINDOW_MS <= RIP_GESTURE_MAX_WINDOW_MS,
              "Gesture window is longer than the gesture motion ring");
 
-/* How long a gesture test request lasts; Studio renews it while its page is
- * open (every 8 s), so a closed or crashed client does not leave the
- * shortcuts off for long. */
+/* How long a gesture test request lasts; Studio renews it every few seconds
+ * while its page is open and in front, so a closed or crashed client does not
+ * leave the shortcuts off for long. */
 #define GESTURE_TEST_MS 20000
 
 /* A tap & hold key's tap that comes this soon after its hold used the ball is
