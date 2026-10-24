@@ -82,6 +82,8 @@ static int on_keymap_binding_released(struct zmk_behavior_binding *binding,
     const struct device *processor = aim_processor(dev);
     zmk_input_processor_runtime_set_aim_key_scale(processor, rip_aim_keys_percent(&data->keys));
     zmk_input_processor_runtime_aim(processor, false);
+    // Whether this hold used the ball belongs to this key (for a tap & hold's tap)
+    zmk_input_processor_runtime_ball_hold_released(processor, event.position);
     return ZMK_BEHAVIOR_OPAQUE;
 }
 

@@ -86,8 +86,11 @@ static int on_keymap_binding_released(struct zmk_behavior_binding *binding,
     }
     data->count--;
 
-    // A recorded press found the processor, so the lookup is cached
-    zmk_input_processor_runtime_gesture(gesture_processor(dev), false);
+    // A recorded press found the processor, so the lookup is cached. Whether
+    // this hold used the ball belongs to this key (for a tap & hold's tap)
+    const struct device *processor = gesture_processor(dev);
+    zmk_input_processor_runtime_gesture(processor, false);
+    zmk_input_processor_runtime_ball_hold_released(processor, event.position);
     return ZMK_BEHAVIOR_OPAQUE;
 }
 

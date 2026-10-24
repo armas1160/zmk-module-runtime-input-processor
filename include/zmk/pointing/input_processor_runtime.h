@@ -100,6 +100,8 @@ struct zmk_input_processor_runtime_config {
     uint32_t gesture_keycodes[ZMK_INPUT_PROCESSOR_GESTURE_DIRS];
     uint16_t gesture_distance;
     uint16_t gesture_still_ms;
+    // Whether gesture behaviors act on this processor (see gesture_attach)
+    bool gesture_supported;
 };
 
 /**
@@ -486,16 +488,30 @@ int zmk_input_processor_runtime_set_gesture(
 int zmk_input_processor_runtime_set_gesture_test(const struct device *dev, bool enabled);
 
 /**
- * @brief Whether the aim or gesture hold that just ended used the ball
+ * @brief Name the key whose aim or gesture hold just ended
  *
- * For the tap side of a tap & hold key whose hold is aim or a gesture: true
- * when such a hold on this processor ended a moment ago after moving the ball
- * (or firing a gesture), so the tap is not typed. Clears the record.
+ * Called by the aim and gesture behaviors right after releasing aim or the
+ * gesture, with the key position, so the record of whether that hold used
+ * the ball belongs to that key only.
  *
  * @param dev Pointer to the device structure
+ * @param position Key position of the released hold
+ */
+void zmk_input_processor_runtime_ball_hold_released(const struct device *dev, uint32_t position);
+
+/**
+ * @brief Whether the aim or gesture hold of this key that just ended used the ball
+ *
+ * For the tap side of a tap & hold key whose hold is aim or a gesture: true
+ * when the hold from the same key position ended a moment ago after moving
+ * the ball (or firing a gesture), so the tap is not typed. Clears the record
+ * when it matches.
+ *
+ * @param dev Pointer to the device structure
+ * @param position Key position of the tap
  * @return true to drop the tap
  */
-bool zmk_input_processor_runtime_take_ball_used(const struct device *dev);
+bool zmk_input_processor_runtime_take_ball_used(const struct device *dev, uint32_t position);
 
 /**
  * @brief Set axis snap mode

@@ -718,28 +718,36 @@ motion of a held gesture key.
 ```
 
 How it works (`src/pointing/rip_gesture_math.h`, host test
-`tests/host/gesture_math_test.c`): the processor feeds every motion event,
-held or not, into a ring of 10 ms slots, so it always knows whether the ball
-is still. A flick is measured from where the ball last turned back on that
-axis (a small wind-up the other way does not eat into it) and must keep within
-about 37 degrees of an axis. A key pressed while the ball is still moving waits
-for it to stop. The keycode is tapped (down, Kconfig
-`ZMK_RUNTIME_INPUT_PROCESSOR_GESTURE_TAP_MS` = 30 ms, up) from the system work
-queue, never held, so the host does not repeat it. After the last gesture key
-is released the cursor stays put until the ball has been still for 60 ms (at
-most 300 ms), so releasing mid-spin does not throw the cursor. Another
-processor (for example one that maps motion to scroll on its layer) leaves the
-motion to the gesture processor while a gesture key holds the ball; the
-gesture behavior tells the processor at boot
-(`zmk_input_processor_runtime_gesture_attach()`).
+`tests/host/gesture_math_test.c`, run at 6, 8, 15 and 20 ms report rates):
+the processor feeds every motion event, held or not, into a ring of 10 ms
+slots, so it always knows whether the ball is still. A flick is judged only on
+the event that completes a report (`sync`), never on its X half alone, which
+would turn a diagonal into left or right. It is measured from where the ball
+last turned back on that axis (a small wind-up the other way does not eat into
+it) and must keep within about 37 degrees of an axis. When reports come slowly
+(a long Bluetooth interval), "still" needs at least two report gaps without
+motion. A key pressed while the ball is still moving waits for it to stop. The
+keycode is tapped (down, Kconfig `ZMK_RUNTIME_INPUT_PROCESSOR_GESTURE_TAP_MS` =
+30 ms, up) from the system work queue, never held, so the host does not repeat
+it, and with timestamp 0, so it does not count as typing for a hold-tap's
+`require-prior-idle-ms`. After the last gesture key is released the cursor
+stays put until the ball has been still for 60 ms (or two report gaps; at most
+300 ms), so releasing mid-spin does not throw the cursor. Another processor
+(for example one that maps motion to scroll on its layer) leaves the motion of
+the same input device to the gesture processor while a gesture key holds the
+ball; the gesture behavior tells the processor at boot
+(`zmk_input_processor_runtime_gesture_attach()`), and only that processor
+reports `gesture_supported`.
 
 For a key that types when tapped and gestures when held, use a hold-tap with
 the gesture behavior as its hold and `&rip_tap_key` as its tap
 (`bindings = <&rip_gesture>, <&rip_tap_key>`, keymap `&my_ht 0 D`).
-`&rip_tap_key` is `&kp` except that it types nothing when the hold that just
-ended used the ball (moved it about 0.5 mm, or fired a gesture), so a quick
-flick released within the tapping term does not also type the key. It works
-the same with `&rip_aim` as the hold.
+`&rip_tap_key` is `&kp` except that it types nothing when the hold of the same
+key that just ended used the ball (moved it about 0.5 mm, or fired a gesture),
+so a quick flick released within the tapping term does not also type the key.
+It works the same with `&rip_aim` as the hold. The behaviors name the released
+key (`zmk_input_processor_runtime_ball_hold_released()`), so one key's hold
+never drops another key's tap.
 
 The settings follow the same write modes as the others and are saved in a
 second custom-settings entry per processor (`<processor-label>_gesture`), so

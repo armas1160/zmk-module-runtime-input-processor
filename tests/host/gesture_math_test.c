@@ -20,12 +20,16 @@
 static int failures;
 static int checks;
 
+/* The sensor reports both axes every REPORT ms (6 on USB, about 15 on BLE).
+ * main() runs every test at several rates. */
+static uint32_t REPORT = 8;
+
 #define CHECK(cond, ...)                                                                           \
     do {                                                                                           \
         checks++;                                                                                  \
         if (!(cond)) {                                                                             \
             failures++;                                                                            \
-            printf("FAIL %s:%d: ", __FILE__, __LINE__);                                            \
+            printf("FAIL %s:%d (report %u ms): ", __FILE__, __LINE__, (unsigned)REPORT);          \
             printf(__VA_ARGS__);                                                                   \
             printf("\n");                                                                          \
         }                                                                                          \
@@ -34,8 +38,6 @@ static int checks;
 /* Firmware defaults: 7 mm at 1200 CPI within the Kconfig window, 150 ms still. */
 static const struct rip_gesture_params P = {.distance = 330, .still_ms = 150, .window_ms = 150};
 
-/* The sensor reports both axes every REPORT ms (6 on USB, about 15 on BLE). */
-#define REPORT 8
 
 struct sim {
     struct rip_gesture g;
@@ -49,16 +51,11 @@ static void sim_init(struct sim *s, uint32_t start) {
     *s = (struct sim){.now = start, .last = RIP_GESTURE_NONE};
 }
 
-/* One report: X then Y, as the driver sends them. */
+/* One report: X, then Y with sync, as the driver sends them. */
 static void report(struct sim *s, bool held, int dx, int dy) {
-    int d = rip_gesture_event(&s->g, &P, held, dx * RIP_GESTURE_MILLI, 0, s->now);
-    if (d == RIP_GESTURE_NONE) {
-        d = rip_gesture_event(&s->g, &P, held, 0, dy * RIP_GESTURE_MILLI, s->now);
-    } else {
-        // The Y half of the same report can not fire again (locked)
-        int again = rip_gesture_event(&s->g, &P, held, 0, dy * RIP_GESTURE_MILLI, s->now);
-        CHECK(again == RIP_GESTURE_NONE, "fired twice within one report");
-    }
+    int x = rip_gesture_event(&s->g, &P, held, dx * RIP_GESTURE_MILLI, 0, false, s->now);
+    CHECK(x == RIP_GESTURE_NONE, "fired on the X half of a report");
+    int d = rip_gesture_event(&s->g, &P, held, 0, dy * RIP_GESTURE_MILLI, true, s->now);
     if (d != RIP_GESTURE_NONE) {
         s->fired[d]++;
         s->fires++;
@@ -469,7 +466,56 @@ static void test_ble_pacing(void) {
     CHECK(s.fires == 1 && s.fired[RIP_GESTURE_UP] == 1, "BLE paced flick up: %d", s.fires);
 }
 
-int main(void) {
+/* Slow reports (Bluetooth): a diagonal is judged on the whole report, never
+ * on its X half, so it does not turn into left or right. */
+static void test_diagonal_slow_reports(void) {
+    const uint32_t gaps[] = {15, 20, 30};
+    for (int k = 0; k < 3; k++) {
+        struct sim s;
+        sim_init(&s, 180000 + 10000 * k);
+        press(&s);
+        for (int i = 0; i < 6; i++) {
+            s.now += gaps[k];
+            report(&s, true, 160, -160); // 45 degrees, about 10 mm/s per axis
+        }
+        CHECK(s.fires == 0, "45 degree flick at %u ms reports fired %d", (unsigned)gaps[k], s.fires);
+        wait_ms(&s, 600);
+        for (int i = 0; i < 6; i++) {
+            s.now += gaps[k];
+            report(&s, true, 160, -134); // about 40 degrees: outside the 37 degree cone
+        }
+        CHECK(s.fires == 0, "40 degree flick at %u ms reports fired %d", (unsigned)gaps[k], s.fires);
+        wait_ms(&s, 600);
+        for (int i = 0; i < 6; i++) {
+            s.now += gaps[k];
+            report(&s, true, 160, -68); // about 23 degrees
+        }
+        CHECK(s.fires == 1 && s.fired[RIP_GESTURE_RIGHT] == 1, "23 degree flick at %u ms reports: %d",
+              (unsigned)gaps[k], s.fires);
+    }
+}
+
+/* Reports far apart (a long Bluetooth interval): the gap inside a spin is not
+ * a stop, so a long spin still fires once, and the drain lasts across it. */
+static void test_slow_report_spin(void) {
+    const struct rip_gesture_params quick = {.distance = 330, .still_ms = 50, .window_ms = 150};
+    struct rip_gesture g = {.last_dir = RIP_GESTURE_NONE};
+    uint32_t now = 200000;
+    rip_gesture_begin(&g);
+    int fires = 0;
+    for (int i = 0; i < 20; i++) { // 1 s of spin, a report every 50 ms
+        now += 50;
+        fires += rip_gesture_event(&g, &quick, true, 200 * RIP_GESTURE_MILLI, 0, false, now) != RIP_GESTURE_NONE;
+        fires += rip_gesture_event(&g, &quick, true, 0, 0, true, now) != RIP_GESTURE_NONE;
+    }
+    CHECK(fires == 1, "slow-report spin fired %d times", fires);
+    CHECK(rip_gesture_still_needed(&g, quick.still_ms) == 100, "still needs two report gaps (100 ms)");
+    rip_gesture_end(&g);
+    CHECK(rip_gesture_draining(&g, now, now + 60), "drain lasts across a report gap");
+    CHECK(!rip_gesture_draining(&g, now, now + 101), "drain ends after two quiet gaps");
+}
+
+static void run_all(void) {
     test_clamp();
     test_directions();
     test_once_per_flick();
@@ -492,6 +538,16 @@ int main(void) {
     test_note_motion();
     test_draining();
     test_ble_pacing();
+    test_diagonal_slow_reports();
+    test_slow_report_spin();
+}
+
+int main(void) {
+    const uint32_t rates[] = {6, 8, 15, 20};
+    for (size_t i = 0; i < sizeof(rates) / sizeof(rates[0]); i++) {
+        REPORT = rates[i];
+        run_all();
+    }
 
     if (failures) {
         printf("gesture_math_test: %d of %d checks FAILED\n", failures, checks);

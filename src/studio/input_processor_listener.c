@@ -111,7 +111,7 @@ static int input_processor_state_changed_listener(const zmk_event_t *eh) {
     info->inertia_enabled = ev->config.inertia_enabled;
     info->inertia_notifications_enabled = ev->config.inertia_notifications_enabled;
     info->inertia_active = ev->config.inertia_active;
-    info->gesture_supported = true;
+    info->gesture_supported = ev->config.gesture_supported;
     info->gesture_left = ev->config.gesture_keycodes[ZMK_INPUT_PROCESSOR_GESTURE_LEFT];
     info->gesture_right = ev->config.gesture_keycodes[ZMK_INPUT_PROCESSOR_GESTURE_RIGHT];
     info->gesture_up = ev->config.gesture_keycodes[ZMK_INPUT_PROCESSOR_GESTURE_UP];

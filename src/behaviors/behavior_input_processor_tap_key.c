@@ -52,7 +52,7 @@ static int on_keymap_binding_pressed(struct zmk_behavior_binding *binding,
     struct behavior_input_processor_tap_key_data *data = dev->data;
     const struct device *processor = tap_key_processor(dev);
 
-    if (processor && zmk_input_processor_runtime_take_ball_used(processor) &&
+    if (processor && zmk_input_processor_runtime_take_ball_used(processor, event.position) &&
         data->dropped_count < TAP_KEY_DROPPED_MAX) {
         LOG_DBG("Tap of position %u dropped: its hold used the ball", event.position);
         data->dropped[data->dropped_count++] = event.position;

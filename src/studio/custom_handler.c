@@ -426,7 +426,7 @@ static int handle_get_input_processor(const cormoran_rip_GetInputProcessorReques
     result.processor.inertia_fast_output_percent = config.inertia_fast_output_percent;
     result.processor.inertia_notifications_enabled = config.inertia_notifications_enabled;
     result.processor.inertia_active = config.inertia_active;
-    result.processor.gesture_supported = true;
+    result.processor.gesture_supported = config.gesture_supported;
     result.processor.gesture_left = config.gesture_keycodes[ZMK_INPUT_PROCESSOR_GESTURE_LEFT];
     result.processor.gesture_right = config.gesture_keycodes[ZMK_INPUT_PROCESSOR_GESTURE_RIGHT];
     result.processor.gesture_up = config.gesture_keycodes[ZMK_INPUT_PROCESSOR_GESTURE_UP];

@@ -29,6 +29,11 @@
  * in RIP_GESTURE_SLOT_MS slots of a ring, so window sums cost a few adds and
  * no event is ever stored. The ring and the time the ball last moved are fed
  * whether the key is held or not, so a press knows whether the ball is still.
+ * A flick is only judged on the event that completes a report (sync): the X
+ * half of a report alone would make a diagonal look like left or right. When
+ * reports come slowly (a long Bluetooth interval), "still" needs at least two
+ * report gaps without motion, so the gap inside a spin is not mistaken for a
+ * stop.
  *
  * Kept free of Zephyr dependencies so it can be unit-tested on the host
  * (see tests/host/gesture_math_test.c). Integer only.
@@ -90,6 +95,9 @@
 #define RIP_GESTURE_DRAIN_STILL_MS 60
 #define RIP_GESTURE_DRAIN_MAX_MS 300
 
+/* Reports further apart than this are separate motions, not the report rate. */
+#define RIP_GESTURE_GAP_MAX_MS 200
+
 #define RIP_GESTURE_MILLI 1000
 
 struct rip_gesture_params {
@@ -114,6 +122,9 @@ struct rip_gesture {
     int8_t last_dir;         /* direction of the last flick in this hold, or NONE */
     bool fired;              /* a flick fired in this hold */
     uint32_t used;           /* motion in this hold, milli-counts (saturating) */
+    uint32_t last_sync_ms;   /* when the last report completed */
+    bool has_sync;           /* last_sync_ms is valid */
+    uint16_t gap_ms;         /* time between the last two reports while moving */
 };
 
 static inline uint16_t rip_gesture_clamp_distance(int64_t distance) {
@@ -258,6 +269,14 @@ static inline uint32_t rip_gesture_quiet_ms(const struct rip_gesture *g, uint32_
     return g->has_moved ? now_ms - g->last_moving_ms : UINT32_MAX;
 }
 
+/* How long "still" must last: at least ms, and two report gaps when reports
+ * come slower than that (the ball is not still between two reports of a
+ * spin). */
+static inline uint32_t rip_gesture_still_needed(const struct rip_gesture *g, uint32_t ms) {
+    uint32_t two_gaps = 2u * g->gap_ms;
+    return two_gaps > ms ? two_gaps : ms;
+}
+
 /* Add motion to the ring and note whether the ball is moving. */
 static inline void rip_gesture_add_slot(struct rip_gesture *g, int32_t dx_milli, int32_t dy_milli,
                                         uint32_t moved_milli, uint32_t now_ms) {
@@ -301,7 +320,8 @@ static inline void rip_gesture_note_motion(struct rip_gesture *g, uint32_t moved
 static inline bool rip_gesture_draining(const struct rip_gesture *g, uint32_t up_ms,
                                         uint32_t now_ms) {
     return now_ms - up_ms < RIP_GESTURE_DRAIN_MAX_MS &&
-           rip_gesture_quiet_ms(g, now_ms) < RIP_GESTURE_DRAIN_STILL_MS;
+           rip_gesture_quiet_ms(g, now_ms) <
+               rip_gesture_still_needed(g, RIP_GESTURE_DRAIN_STILL_MS);
 }
 
 /* A gesture key went down (the first of them). Starts locked: the first
@@ -334,12 +354,12 @@ static inline void rip_gesture_rearm(struct rip_gesture *g, const struct rip_ges
         return;
     }
     uint32_t quiet = rip_gesture_quiet_ms(g, now_ms);
-    if (quiet < p->still_ms) {
+    uint32_t still = rip_gesture_still_needed(g, p->still_ms);
+    if (quiet < still) {
         return;
     }
     uint8_t armed = RIP_GESTURE_ALL;
-    if (g->last_dir != RIP_GESTURE_NONE &&
-        quiet - p->still_ms < RIP_GESTURE_REVERSE_EXTRA_MS) {
+    if (g->last_dir != RIP_GESTURE_NONE && quiet - still < RIP_GESTURE_REVERSE_EXTRA_MS) {
         armed &= (uint8_t)~(1u << rip_gesture_opposite(g->last_dir));
     }
     if (armed != g->armed) {
@@ -377,12 +397,13 @@ static inline int rip_gesture_flick(const struct rip_gesture *g,
 }
 
 /*
- * Feed one motion event (milli-counts, cursor frame) at now_ms. Returns the
+ * Feed one motion event (milli-counts, cursor frame) at now_ms; sync marks the
+ * event that completes a report (the input event's sync flag). Returns the
  * direction that fired, or RIP_GESTURE_NONE. Call it for every event of the
  * processor, held or not, so the ring and the stillness stay current.
  */
 static inline int rip_gesture_event(struct rip_gesture *g, const struct rip_gesture_params *p,
-                                    bool held, int32_t dx_milli, int32_t dy_milli,
+                                    bool held, int32_t dx_milli, int32_t dy_milli, bool sync,
                                     uint32_t now_ms) {
     if (held) {
         rip_gesture_rearm(g, p, now_ms);
@@ -391,7 +412,17 @@ static inline int rip_gesture_event(struct rip_gesture *g, const struct rip_gest
     }
     rip_gesture_add(g, dx_milli, dy_milli, now_ms);
     int64_t along_last = rip_gesture_turn(g, now_ms, g->last_dir);
-    if (!held) {
+    if (sync) {
+        // The report rate while the ball keeps moving (see rip_gesture_still_needed)
+        uint32_t gap = now_ms - g->last_sync_ms;
+        if (g->has_sync && gap <= RIP_GESTURE_GAP_MAX_MS) {
+            g->gap_ms = (uint16_t)gap;
+        }
+        g->last_sync_ms = now_ms;
+        g->has_sync = true;
+    }
+    // A flick is judged on whole reports only
+    if (!held || !sync) {
         return RIP_GESTURE_NONE;
     }
     // The thumb drags the ball back after a flick: the next flick may come

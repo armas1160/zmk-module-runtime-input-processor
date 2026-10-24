@@ -230,16 +230,24 @@ struct runtime_processor_data {
     struct rip_gesture gesture;
     uint32_t gesture_up_ms;
     bool gesture_draining;
-    int8_t gesture_pending_dir;
+    // Flicks waiting for the fire work, oldest first (a few, in case the work
+    // queue is busy)
+    int8_t gesture_pending[4];
+    uint8_t gesture_pending_count;
     int64_t gesture_test_until;
+    // The input device whose motion the detector sees; other processors only
+    // leave motion from this device to it
+    const struct device *gesture_input_dev;
     struct k_spinlock gesture_lock;
     // The shortcut being tapped (system work queue only)
     uint32_t gesture_tapped_keycode;
     struct k_work gesture_fire_work;
     struct k_work_delayable gesture_release_work;
-    // When an aim or gesture hold that used the ball ended (0 = none): the tap
-    // of the tap & hold key that held it is dropped. Behavior context only
+    // When an aim or gesture hold that used the ball ended (0 = none) and the
+    // key position it was held from (set by its behavior right after): the tap
+    // of that tap & hold key is dropped. Behavior context only
     int64_t ball_used_at;
+    uint32_t ball_used_position;
 
     // Input is dropped until this uptime after a mouse button changed
     // (0 = not frozen). Only touched from the input thread.
@@ -1207,11 +1215,16 @@ static bool gesture_handle_event(struct runtime_processor_data *data, struct inp
     };
 
     k_spinlock_key_t key = k_spin_lock(&data->gesture_lock);
+    data->gesture_input_dev = event->dev;
     bool engaged = gesture_engaged(data, now);
     int dir = rip_gesture_event(&data->gesture, &params, data->gesture_hold_count > 0, dx, dy,
-                                now);
+                                event->sync, now);
     if (dir != RIP_GESTURE_NONE) {
-        data->gesture_pending_dir = (int8_t)dir;
+        if (data->gesture_pending_count < ARRAY_SIZE(data->gesture_pending)) {
+            data->gesture_pending[data->gesture_pending_count++] = (int8_t)dir;
+        } else {
+            LOG_WRN("Gesture %d dropped: the fire work is behind", dir);
+        }
     }
     k_spin_unlock(&data->gesture_lock, key);
 
@@ -1225,27 +1238,39 @@ static bool gesture_handle_event(struct runtime_processor_data *data, struct inp
 }
 
 /* For processors other than gesture_dev: whether its gesture keys hold the
- * ball, so the motion is left for gesture_dev. */
-static bool gesture_holds_ball(void) {
+ * ball this event comes from, so the motion is left for gesture_dev. Motion
+ * of another device (a second pointing device, a scroll listener) is never
+ * gesture_dev's and is handled as usual. */
+static bool gesture_holds_ball(const struct input_event *event) {
     struct runtime_processor_data *owner = gesture_dev->data;
     uint32_t now = (uint32_t)k_uptime_get();
     k_spinlock_key_t key = k_spin_lock(&owner->gesture_lock);
-    bool engaged = gesture_engaged(owner, now);
+    bool engaged = event->dev == owner->gesture_input_dev && gesture_engaged(owner, now);
     k_spin_unlock(&owner->gesture_lock, key);
     return engaged;
 }
 
-/* Motion another processor uses up (scroll on its layer) never reaches
- * gesture_dev, which only needs to know that the ball moves. */
-static void gesture_note_motion(int32_t value) {
+/* Motion of gesture_dev's ball that another processor uses up (scroll on its
+ * layer) never reaches gesture_dev, which only needs to know that the ball
+ * moves. */
+static void gesture_note_motion(const struct input_event *event) {
     struct runtime_processor_data *owner = gesture_dev->data;
     uint32_t now = (uint32_t)k_uptime_get();
-    uint32_t moved = input_value_magnitude((int16_t)CLAMP(value, INT16_MIN, INT16_MAX)) *
+    uint32_t moved = input_value_magnitude((int16_t)CLAMP(event->value, INT16_MIN, INT16_MAX)) *
                      RIP_GESTURE_MILLI;
     k_spinlock_key_t key = k_spin_lock(&owner->gesture_lock);
-    rip_gesture_note_motion(&owner->gesture, moved, now);
+    if (event->dev == owner->gesture_input_dev) {
+        rip_gesture_note_motion(&owner->gesture, moved, now);
+    }
     k_spin_unlock(&owner->gesture_lock, key);
 }
+
+/* Gesture shortcuts are raised with timestamp 0: a gesture is not typing, so
+ * it must not count as the last key tapped for a hold-tap's
+ * require-prior-idle-ms (which would make the next press of a gesture tap
+ * key a tap at once and type its letter). ZMK keeps the newest timestamp, so
+ * 0 never replaces it. */
+#define GESTURE_KEY_TIMESTAMP 0
 
 /* The shortcut a gesture is tapping goes up (system work queue). */
 static void gesture_release_tap(struct runtime_processor_data *data) {
@@ -1253,7 +1278,7 @@ static void gesture_release_tap(struct runtime_processor_data *data) {
         return;
     }
     raise_zmk_keycode_state_changed_from_encoded(data->gesture_tapped_keycode, false,
-                                                 k_uptime_get());
+                                                 GESTURE_KEY_TIMESTAMP);
     data->gesture_tapped_keycode = 0;
 }
 
@@ -1270,34 +1295,42 @@ static void gesture_release_work_handler(struct k_work *work) {
 static void gesture_fire_work_handler(struct k_work *work) {
     struct runtime_processor_data *data =
         CONTAINER_OF(work, struct runtime_processor_data, gesture_fire_work);
-    int64_t now = k_uptime_get();
 
-    k_spinlock_key_t key = k_spin_lock(&data->gesture_lock);
-    int dir = data->gesture_pending_dir;
-    data->gesture_pending_dir = RIP_GESTURE_NONE;
-    uint32_t keycode = dir >= 0 && dir < RIP_GESTURE_DIRS ? data->gesture_keycodes[dir] : 0;
-    bool test = data->gesture_test_until > now;
-    k_spin_unlock(&data->gesture_lock, key);
-    if (dir < 0 || dir >= RIP_GESTURE_DIRS) {
-        return;
-    }
+    for (;;) {
+        int64_t now = k_uptime_get();
+        k_spinlock_key_t key = k_spin_lock(&data->gesture_lock);
+        if (data->gesture_pending_count == 0) {
+            k_spin_unlock(&data->gesture_lock, key);
+            return;
+        }
+        int dir = data->gesture_pending[0];
+        data->gesture_pending_count--;
+        memmove(&data->gesture_pending[0], &data->gesture_pending[1],
+                data->gesture_pending_count * sizeof(data->gesture_pending[0]));
+        uint32_t keycode = dir >= 0 && dir < RIP_GESTURE_DIRS ? data->gesture_keycodes[dir] : 0;
+        bool test = data->gesture_test_until > now;
+        k_spin_unlock(&data->gesture_lock, key);
+        if (dir < 0 || dir >= RIP_GESTURE_DIRS) {
+            continue;
+        }
 
-    LOG_INF("Gesture %d fired: 0x%08x%s", dir, (unsigned int)keycode,
-            test ? " (test, not sent)" : "");
-    if (test) {
-        raise_zmk_input_processor_gesture_fired((struct zmk_input_processor_gesture_fired){
-            .dev = data->dev, .direction = (uint8_t)dir, .keycode = keycode});
-        return;
+        LOG_INF("Gesture %d fired: 0x%08x%s", dir, (unsigned int)keycode,
+                test ? " (test, not sent)" : "");
+        if (test) {
+            raise_zmk_input_processor_gesture_fired((struct zmk_input_processor_gesture_fired){
+                .dev = data->dev, .direction = (uint8_t)dir, .keycode = keycode});
+            continue;
+        }
+        if (keycode == 0) {
+            continue;
+        }
+        // One tap at a time: one still down goes up first
+        k_work_cancel_delayable(&data->gesture_release_work);
+        gesture_release_tap(data);
+        raise_zmk_keycode_state_changed_from_encoded(keycode, true, GESTURE_KEY_TIMESTAMP);
+        data->gesture_tapped_keycode = keycode;
+        k_work_schedule(&data->gesture_release_work, K_MSEC(GESTURE_TAP_MS));
     }
-    if (keycode == 0) {
-        return;
-    }
-    // One tap at a time: one still down goes up first
-    k_work_cancel_delayable(&data->gesture_release_work);
-    gesture_release_tap(data);
-    raise_zmk_keycode_state_changed_from_encoded(keycode, true, now);
-    data->gesture_tapped_keycode = keycode;
-    k_work_schedule(&data->gesture_release_work, K_MSEC(GESTURE_TAP_MS));
 }
 
 static int runtime_processor_handle_event(const struct device *dev, struct input_event *event,
@@ -1324,7 +1357,7 @@ static int runtime_processor_handle_event(const struct device *dev, struct input
         if (gesture_handle_event(data, event, x_idx >= 0)) {
             return ZMK_INPUT_PROC_CONTINUE;
         }
-    } else if (gesture_dev != NULL && gesture_holds_ball()) {
+    } else if (gesture_dev != NULL && gesture_holds_ball(event)) {
         return ZMK_INPUT_PROC_CONTINUE;
     }
 
@@ -1342,7 +1375,7 @@ static int runtime_processor_handle_event(const struct device *dev, struct input
     // Motion this processor uses for something else than gesture_dev's cursor
     // (scroll on its layer) still tells gesture_dev that the ball moves
     if (gesture_dev != NULL && gesture_dev != dev) {
-        gesture_note_motion(event->value);
+        gesture_note_motion(event);
     }
 
     // An aim hold that moves the ball is in use: the tap of its tap & hold
@@ -2328,10 +2361,12 @@ static int runtime_processor_init(const struct device *dev) {
     data->gesture_hold_count = 0;
     data->gesture = (struct rip_gesture){.last_dir = RIP_GESTURE_NONE};
     data->gesture_draining = false;
-    data->gesture_pending_dir = RIP_GESTURE_NONE;
+    data->gesture_pending_count = 0;
     data->gesture_test_until = 0;
+    data->gesture_input_dev = NULL;
     data->gesture_tapped_keycode = 0;
     data->ball_used_at = 0;
+    data->ball_used_position = UINT32_MAX;
     k_work_init(&data->gesture_fire_work, gesture_fire_work_handler);
     k_work_init_delayable(&data->gesture_release_work, gesture_release_work_handler);
 
@@ -2778,6 +2813,7 @@ int zmk_input_processor_runtime_get_config(const struct device *dev, const char 
                sizeof(config->gesture_keycodes));
         config->gesture_distance = data->persistent_gesture_distance;
         config->gesture_still_ms = data->persistent_gesture_still_ms;
+        config->gesture_supported = dev == gesture_dev;
     }
 
     return 0;
@@ -3917,6 +3953,7 @@ void zmk_input_processor_runtime_aim(const struct device *dev, bool hold) {
         bool used = atomic_get(&data->aim_hold_motion) >=
                     (atomic_val_t)(RIP_GESTURE_USED_MILLI / RIP_GESTURE_MILLI);
         data->ball_used_at = used ? k_uptime_get() : 0;
+        data->ball_used_position = UINT32_MAX; // the behavior names its key next
     }
 
     // A glide that is still running would carry the cursor past the target
@@ -3978,6 +4015,7 @@ void zmk_input_processor_runtime_gesture(const struct device *dev, bool hold) {
             // used the ball decides the tap of its tap & hold key
             bool used = rip_gesture_end(&data->gesture);
             data->ball_used_at = used ? now : 0;
+            data->ball_used_position = UINT32_MAX; // the behavior names its key next
             data->gesture_up_ms = (uint32_t)now;
             data->gesture_draining = true;
         }
@@ -4066,15 +4104,28 @@ int zmk_input_processor_runtime_set_gesture_test(const struct device *dev, bool 
     return 0;
 }
 
-bool zmk_input_processor_runtime_take_ball_used(const struct device *dev) {
+void zmk_input_processor_runtime_ball_hold_released(const struct device *dev, uint32_t position) {
+    if (!dev) {
+        return;
+    }
+
+    // The aim or gesture release just before recorded whether the ball was used
+    struct runtime_processor_data *data = dev->data;
+    data->ball_used_position = position;
+}
+
+bool zmk_input_processor_runtime_take_ball_used(const struct device *dev, uint32_t position) {
     if (!dev) {
         return false;
     }
 
     struct runtime_processor_data *data = dev->data;
+    if (data->ball_used_at == 0 || data->ball_used_position != position) {
+        return false;
+    }
     int64_t at = data->ball_used_at;
     data->ball_used_at = 0;
-    return at != 0 && k_uptime_get() - at <= BALL_USED_TAP_MS;
+    return k_uptime_get() - at <= BALL_USED_TAP_MS;
 }
 
 int zmk_input_processor_runtime_set_xy_to_scroll_enabled(
