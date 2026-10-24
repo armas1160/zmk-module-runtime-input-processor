@@ -45,6 +45,23 @@ config ZMK_RUNTIME_INPUT_PROCESSOR_AIM_INTERVAL_MS
       this long, the rest is sent in reports this far apart until none is
       left. Close to the Bluetooth connection interval avoids queueing.
 
+config ZMK_RUNTIME_INPUT_PROCESSOR_GESTURE_WINDOW_MS
+    int "Gesture flick window in milliseconds"
+    range 50 310
+    default 150
+    help
+      While a gesture key is held, a flick is motion that covers the gesture
+      distance within this long. Rolling the ball slower than that never
+      fires, so bringing the thumb back after a flick is safe.
+
+config ZMK_RUNTIME_INPUT_PROCESSOR_GESTURE_TAP_MS
+    int "How long a gesture holds its shortcut down, in milliseconds"
+    range 5 200
+    default 30
+    help
+      A gesture taps its keycode: down, this long, up. Never held, so the
+      host does not repeat it.
+
 config ZMK_RUNTIME_INPUT_PROCESSOR_STUDIO_RPC
     bool "Enable runtime input processor custom Studio RPC"
     depends on ZMK_STUDIO

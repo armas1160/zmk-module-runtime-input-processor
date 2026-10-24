@@ -1,0 +1,22 @@
+# Copyright (c) 2026 The ZMK Contributors
+# SPDX-License-Identifier: MIT
+
+description: |
+  Behavior for trackball gestures while a key is held: the processor's motion
+  moves nothing, and a flick up, down, left or right taps the keycode the
+  processor assigns to that direction (gesture-left etc., runtime-settable),
+  once per flick. The temp-layer layer stays active while the key is held,
+  and after the release the cursor stays put until the ball stops. Usable as
+  the hold binding of a hold-tap (&ht 0 <key>; pair it with
+  zmk,behavior-input-processor-tap-key so a quick flick does not type the
+  tap).
+
+compatible: "zmk,behavior-input-processor-gesture"
+
+include: zero_param.yaml
+
+properties:
+  processor-name:
+    type: string
+    required: true
+    description: Name of the runtime input processor whose motion the gestures read

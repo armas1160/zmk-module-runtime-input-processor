@@ -134,6 +134,50 @@ properties:
       a thumb that moves with the click does not pull the cursor off its
       target. 0 turns it off.
 
+  gesture-left:
+    type: int
+    default: 0
+    description: |
+      What a flick to the left fires while a gesture behavior
+      (zmk,behavior-input-processor-gesture) is held: a keycode as &kp's
+      parameter, implicit modifiers allowed (e.g. <LC(LEFT)>), or 0 for
+      nothing. Directions are in the cursor frame (after this processor's
+      rotation, inversion and swap). Runtime-settable (SetGestureRequest) and
+      persisted in its own entry; this is the default.
+
+  gesture-right:
+    type: int
+    default: 0
+    description: What a flick to the right fires (see gesture-left).
+
+  gesture-up:
+    type: int
+    default: 0
+    description: What a flick up fires (see gesture-left).
+
+  gesture-down:
+    type: int
+    default: 0
+    description: What a flick down fires (see gesture-left).
+
+  gesture-distance:
+    type: int
+    default: 330
+    description: |
+      Sensor counts a flick must cover within the gesture window
+      (CONFIG_ZMK_RUNTIME_INPUT_PROCESSOR_GESTURE_WINDOW_MS) to fire; slower
+      rolling never fires. 330 is about 7 mm of the ball's surface at
+      1200 CPI. Clamped to 40..2400. Runtime-settable and persisted.
+
+  gesture-still-ms:
+    type: int
+    default: 150
+    description: |
+      After a flick nothing more fires until the ball has been still this
+      long (or turns back for the next flick; the opposite direction always
+      waits for the stillness plus 250 ms), so one flick fires once.
+      Clamped to 50..1000. Runtime-settable and persisted.
+
   track-remainders:
     type: boolean
     description: Track remainders for scaling operations (enabled if present)

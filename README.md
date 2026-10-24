@@ -684,6 +684,74 @@ and load the aim settings from the devicetree). Over Studio RPC it is
 `zmk_input_processor_runtime_aim()`. The temporary-config behavior leaves
 them unchanged while held and restores the saved values on release.
 
+### Gestures (flick the ball while a key is held)
+
+While a key bound to the gesture behavior is held, the processor's motion
+does not move the cursor; flicking the ball up, down, left or right taps the
+keycode assigned to that direction, once. The directions are in the cursor
+frame (after the processor's rotation, inversion and swap). The temp-layer
+layer stays active while the key is held, and it is never activated by the
+motion of a held gesture key.
+
+- `gesture-left`, `gesture-right`, `gesture-up`, `gesture-down` (default `0`
+  = nothing): keycodes as `&kp`'s parameter, implicit modifiers allowed
+  (`<LC(LEFT)>`). Keyboard and consumer usages only.
+- `gesture-distance` (default `330`): sensor counts a flick covers within
+  Kconfig `ZMK_RUNTIME_INPUT_PROCESSOR_GESTURE_WINDOW_MS` (default `150`);
+  slower rolling never fires. Clamped to `40..2400`.
+- `gesture-still-ms` (default `150`): after a flick nothing more fires until
+  the ball has been still this long, or turns back (the thumb dragging it back
+  for the next flick). The opposite direction always waits for the stillness
+  plus 250 ms, so a drag back never undoes the gesture. Clamped to `50..1000`.
+
+```dts
+#include <behaviors/runtime-input-processor.dtsi>  // provides &rip_gesture
+
+&my_rip {
+    gesture-left = <LC(LEFT)>;   // macOS: move a space left
+    gesture-right = <LC(RIGHT)>;
+    gesture-up = <LC(UP)>;       // Mission Control
+    gesture-down = <F11>;        // show the desktop
+};
+
+// keymap: &rip_gesture on a key of the mouse layer
+```
+
+How it works (`src/pointing/rip_gesture_math.h`, host test
+`tests/host/gesture_math_test.c`): the processor feeds every motion event,
+held or not, into a ring of 10 ms slots, so it always knows whether the ball
+is still. A flick is measured from where the ball last turned back on that
+axis (a small wind-up the other way does not eat into it) and must keep within
+about 37 degrees of an axis. A key pressed while the ball is still moving waits
+for it to stop. The keycode is tapped (down, Kconfig
+`ZMK_RUNTIME_INPUT_PROCESSOR_GESTURE_TAP_MS` = 30 ms, up) from the system work
+queue, never held, so the host does not repeat it. After the last gesture key
+is released the cursor stays put until the ball has been still for 60 ms (at
+most 300 ms), so releasing mid-spin does not throw the cursor. Another
+processor (for example one that maps motion to scroll on its layer) leaves the
+motion to the gesture processor while a gesture key holds the ball; the
+gesture behavior tells the processor at boot
+(`zmk_input_processor_runtime_gesture_attach()`).
+
+For a key that types when tapped and gestures when held, use a hold-tap with
+the gesture behavior as its hold and `&rip_tap_key` as its tap
+(`bindings = <&rip_gesture>, <&rip_tap_key>`, keymap `&my_ht 0 D`).
+`&rip_tap_key` is `&kp` except that it types nothing when the hold that just
+ended used the ball (moved it about 0.5 mm, or fired a gesture), so a quick
+flick released within the tapping term does not also type the key. It works
+the same with `&rip_aim` as the hold.
+
+The settings follow the same write modes as the others and are saved in a
+second custom-settings entry per processor (`<processor-label>_gesture`), so
+the main settings blob keeps its layout. Over Studio RPC it is
+`SetGestureRequest` (all four keycodes, distance and still time at once) and
+the `gesture_*` fields of `InputProcessorInfo`. `SetGestureTestRequest` turns
+on a test mode for about a minute (clients renew it): flicks then send a
+`GestureFiredNotification` instead of their keycodes. The firmware API is
+`zmk_input_processor_runtime_set_gesture()`,
+`zmk_input_processor_runtime_set_gesture_test()` and
+`zmk_input_processor_runtime_gesture()` for holding and releasing.
+
 ### Normal Smoothing
 
 `smoothing-ms` (default `0` = off) runs the aim filter while no aim key is

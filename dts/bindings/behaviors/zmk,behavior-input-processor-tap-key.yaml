@@ -1,0 +1,19 @@
+# Copyright (c) 2026 The ZMK Contributors
+# SPDX-License-Identifier: MIT
+
+description: |
+  Key press for the tap side of a hold-tap whose hold is aim or a gesture
+  (bindings = <&aim>, <&this>): like &kp, but when the hold that just ended
+  used the ball (moved it, or fired a gesture) the tap is not typed. Without
+  it, letting go before the tapping term after a quick aim or flick would
+  also type the key.
+
+compatible: "zmk,behavior-input-processor-tap-key"
+
+include: one_param.yaml
+
+properties:
+  processor-name:
+    type: string
+    required: true
+    description: Name of the runtime input processor the hold acts on

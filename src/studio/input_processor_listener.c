@@ -13,6 +13,7 @@
 #include <zmk/event_manager.h>
 #include <zmk/events/input_processor_state_changed.h>
 #include <zmk/events/input_processor_inertia_state_changed.h>
+#include <zmk/events/input_processor_gesture_fired.h>
 #include <zmk/pointing/input_processor_runtime.h>
 #include <zmk/studio/custom.h>
 #include <zmk/workqueue.h>
@@ -110,6 +111,13 @@ static int input_processor_state_changed_listener(const zmk_event_t *eh) {
     info->inertia_enabled = ev->config.inertia_enabled;
     info->inertia_notifications_enabled = ev->config.inertia_notifications_enabled;
     info->inertia_active = ev->config.inertia_active;
+    info->gesture_supported = true;
+    info->gesture_left = ev->config.gesture_keycodes[ZMK_INPUT_PROCESSOR_GESTURE_LEFT];
+    info->gesture_right = ev->config.gesture_keycodes[ZMK_INPUT_PROCESSOR_GESTURE_RIGHT];
+    info->gesture_up = ev->config.gesture_keycodes[ZMK_INPUT_PROCESSOR_GESTURE_UP];
+    info->gesture_down = ev->config.gesture_keycodes[ZMK_INPUT_PROCESSOR_GESTURE_DOWN];
+    info->gesture_distance = ev->config.gesture_distance;
+    info->gesture_still_ms = ev->config.gesture_still_ms;
 
     // Send notification via custom studio subsystem
     pb_callback_t encode_cb = {.funcs.encode = encode_notification, .arg = &notification};
@@ -199,6 +207,55 @@ ZMK_LISTENER(input_processor_inertia_state_listener,
              input_processor_inertia_state_changed_listener);
 ZMK_SUBSCRIPTION(input_processor_inertia_state_listener,
                  zmk_input_processor_inertia_state_changed);
+
+/* Gestures fired in test mode go out the same way as the inertia
+ * transitions: queued, then sent from the low priority work queue. */
+struct gesture_fired_notification {
+    const struct device *dev;
+    uint8_t direction;
+    uint32_t keycode;
+};
+
+K_MSGQ_DEFINE(gesture_fired_notifications, sizeof(struct gesture_fired_notification), 8, 4);
+
+static void send_gesture_fired_notifications(struct k_work *work) {
+    ARG_UNUSED(work);
+    struct gesture_fired_notification fired;
+    while (k_msgq_get(&gesture_fired_notifications, &fired, K_NO_WAIT) == 0) {
+        int id = zmk_input_processor_runtime_get_id(fired.dev);
+        if (id < 0) {
+            continue;
+        }
+        cormoran_rip_Notification notification = cormoran_rip_Notification_init_zero;
+        notification.which_notification_type = cormoran_rip_Notification_gesture_fired_tag;
+        notification.notification_type.gesture_fired.id = id;
+        notification.notification_type.gesture_fired.direction = fired.direction;
+        notification.notification_type.gesture_fired.keycode = fired.keycode;
+        pb_callback_t encode_cb = {.funcs.encode = encode_notification, .arg = &notification};
+        raise_zmk_studio_custom_notification((struct zmk_studio_custom_notification){
+            .subsystem_index = find_subsystem_index("cormoran_rip"), .encode_payload = encode_cb});
+    }
+}
+
+K_WORK_DEFINE(gesture_fired_notification_work, send_gesture_fired_notifications);
+
+static int input_processor_gesture_fired_listener(const zmk_event_t *eh) {
+    const struct zmk_input_processor_gesture_fired *ev =
+        as_zmk_input_processor_gesture_fired(eh);
+    if (!ev) {
+        return ZMK_EV_EVENT_BUBBLE;
+    }
+    struct gesture_fired_notification fired = {
+        .dev = ev->dev, .direction = ev->direction, .keycode = ev->keycode};
+    if (k_msgq_put(&gesture_fired_notifications, &fired, K_NO_WAIT) < 0) {
+        LOG_WRN("Gesture notification queue full, dropping one");
+    }
+    k_work_submit_to_queue(zmk_workqueue_lowprio_work_q(), &gesture_fired_notification_work);
+    return ZMK_EV_EVENT_BUBBLE;
+}
+
+ZMK_LISTENER(input_processor_gesture_fired_listener, input_processor_gesture_fired_listener);
+ZMK_SUBSCRIPTION(input_processor_gesture_fired_listener, zmk_input_processor_gesture_fired);
 
 // NOTE: relay from peripheral is not required because all input-processors can
 // be defined in central side

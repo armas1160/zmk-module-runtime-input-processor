@@ -24,6 +24,7 @@
 #include <zmk/endpoints.h>
 #include <zmk/events/input_processor_state_changed.h>
 #include <zmk/events/input_processor_inertia_state_changed.h>
+#include <zmk/events/input_processor_gesture_fired.h>
 #include <zmk/events/keycode_state_changed.h>
 #include <zmk/events/layer_state_changed.h>
 #include <zmk/events/position_state_changed.h>
@@ -33,6 +34,7 @@
 
 #include "rip_accel_math.h"
 #include "rip_aim_math.h"
+#include "rip_gesture_math.h"
 #include "rip_temp_layer_math.h"
 #include "rip_tilt_math.h"
 
@@ -64,6 +66,17 @@ struct runtime_processor_config {
     int32_t initial_smoothing_ms;
     // Input dropped after a mouse button press or release (0 = off)
     uint32_t click_freeze_ms;
+    // Gesture defaults from DT: what a flick fires (ZMK encoded keycodes as
+    // &kp's parameter, 0 = nothing; left, right, up, down), how far it must
+    // go and how long the ball must be still before the next. Kept raw and
+    // clamped when applied (see rip_gesture_math.h)
+    uint32_t initial_gesture_keycodes[RIP_GESTURE_DIRS];
+    int32_t initial_gesture_distance;
+    int32_t initial_gesture_still_ms;
+#if IS_ENABLED(CONFIG_ZMK_CUSTOM_SETTINGS)
+    // Custom-settings key of the gesture settings ("<processor-label>_gesture")
+    const char *gesture_settings_key;
+#endif
     // Temp-layer behavior references for efficient comparison
     const struct device *temp_layer_transparent_behavior;
     const struct device *temp_layer_kp_behavior;
@@ -110,6 +123,22 @@ struct runtime_processor_config {
 /* Aim mode: how often what the filter holds back is released once input
  * stops (see rip_aim_math.h). */
 #define AIM_INTERVAL_MS CONFIG_ZMK_RUNTIME_INPUT_PROCESSOR_AIM_INTERVAL_MS
+
+/* Gestures: a flick covers the gesture distance within this window, and the
+ * shortcut it fires is held this long (see rip_gesture_math.h). */
+#define GESTURE_WINDOW_MS CONFIG_ZMK_RUNTIME_INPUT_PROCESSOR_GESTURE_WINDOW_MS
+#define GESTURE_TAP_MS CONFIG_ZMK_RUNTIME_INPUT_PROCESSOR_GESTURE_TAP_MS
+
+BUILD_ASSERT(GESTURE_WINDOW_MS <= RIP_GESTURE_MAX_WINDOW_MS,
+             "Gesture window is longer than the gesture motion ring");
+
+/* How long a gesture test request lasts; Studio renews it while its page is
+ * open, so a closed or crashed client does not leave the shortcuts off. */
+#define GESTURE_TEST_MS 65000
+
+/* A tap & hold key's tap that comes this soon after its hold used the ball is
+ * dropped (the hold-tap releases the hold and presses the tap in one go). */
+#define BALL_USED_TAP_MS 20
 
 BUILD_ASSERT(INERTIA_BUCKETS >= INERTIA_WINDOW_SLICES + 2,
              "Inertia bucket count must exceed window slices by at least two");
@@ -179,6 +208,38 @@ struct runtime_processor_data {
     struct rip_aim_axis aim_axis[2];
     struct k_spinlock aim_lock;
     struct k_work_delayable aim_work;
+    // Motion while an aim key is held (sensor counts since the newest aim
+    // press), to tell whether a tap & hold key's hold used the ball
+    atomic_t aim_hold_motion;
+
+    // Gestures (see rip_gesture_math.h): what each direction fires, how far a
+    // flick must go and how long the ball must be still before the next, and
+    // their persistent baseline
+    uint32_t gesture_keycodes[RIP_GESTURE_DIRS];
+    uint16_t gesture_distance;
+    uint16_t gesture_still_ms;
+    uint32_t persistent_gesture_keycodes[RIP_GESTURE_DIRS];
+    uint16_t persistent_gesture_distance;
+    uint16_t persistent_gesture_still_ms;
+    // Gesture keys held, the detector, when the last one went up (the cursor
+    // stays put while draining, until the ball stops), the direction waiting
+    // for the fire work and test mode (until this uptime: Studio is told
+    // instead of the shortcut being sent). gesture_lock guards them between
+    // the input thread, the behaviors, the RPC and the work.
+    uint8_t gesture_hold_count;
+    struct rip_gesture gesture;
+    uint32_t gesture_up_ms;
+    bool gesture_draining;
+    int8_t gesture_pending_dir;
+    int64_t gesture_test_until;
+    struct k_spinlock gesture_lock;
+    // The shortcut being tapped (system work queue only)
+    uint32_t gesture_tapped_keycode;
+    struct k_work gesture_fire_work;
+    struct k_work_delayable gesture_release_work;
+    // When an aim or gesture hold that used the ball ended (0 = none): the tap
+    // of the tap & hold key that held it is dropped. Behavior context only
+    int64_t ball_used_at;
 
     // Input is dropped until this uptime after a mouse button changed
     // (0 = not frozen). Only touched from the input thread.
@@ -327,9 +388,9 @@ static void temp_layer_deactivation_work_handler(struct k_work *work) {
     struct runtime_processor_data *data =
         CONTAINER_OF(dwork, struct runtime_processor_data, temp_layer_deactivation_work);
 
-    // A held aim key keeps the layer; its release re-arms this work
+    // A held aim or gesture key keeps the layer; its release re-arms this work
     if (!data->temp_layer_layer_active || data->temp_layer_keep_active ||
-        data->aim_hold_count > 0) {
+        data->aim_hold_count > 0 || data->gesture_hold_count > 0) {
         return;
     }
 
@@ -1026,7 +1087,8 @@ static void temp_layer_extend_on_other_input(const struct runtime_processor_conf
     ARG_UNUSED(event);
     if (!cfg->temp_layer_extend_on_other_input ||
         !data->temp_layer_enabled || !data->temp_layer_layer_active ||
-        data->temp_layer_keep_active || data->aim_hold_count > 0) {
+        data->temp_layer_keep_active || data->aim_hold_count > 0 ||
+        data->gesture_hold_count > 0) {
         return;
     }
     k_work_reschedule(&data->temp_layer_deactivation_work,
@@ -1057,6 +1119,187 @@ static void temp_layer_count_distance(struct runtime_processor_data *data, int32
     }
 }
 
+/*
+ * Gestures (see rip_gesture_math.h). The processor the gesture behaviors act
+ * on (gesture_dev, found when they start) watches every motion event it gets:
+ * while a gesture key is held, and after the release until the ball stops,
+ * the motion moves nothing, and a flick fires its direction's shortcut once.
+ * Any other processor leaves that motion alone meanwhile, so a held gesture
+ * key works the same on a layer where it would turn the motion into scroll.
+ */
+static const struct device *gesture_dev;
+
+BUILD_ASSERT(RIP_TILT_FIXED_ONE == RIP_GESTURE_MILLI,
+             "Gesture milli-counts use the scale of the rotation matrix");
+BUILD_ASSERT(RIP_GESTURE_DIRS == ZMK_INPUT_PROCESSOR_GESTURE_DIRS,
+             "Gesture directions differ from the public API");
+
+/* A keycode a gesture may fire: 0 (nothing) or a key or consumer usage, as
+ * &kp's parameter (implicit modifiers in the top byte). */
+static bool gesture_keycode_valid(uint32_t keycode) {
+    if (keycode == 0) {
+        return true;
+    }
+    uint16_t page = ZMK_HID_USAGE_PAGE(keycode);
+    return (page == 0 || page == HID_USAGE_KEY || page == HID_USAGE_CONSUMER) &&
+           ZMK_HID_USAGE_ID(keycode) != 0;
+}
+
+/* One event in the cursor frame, in milli-counts: the processor's rotation
+ * and tilt (without the remainders carried between events, which only round),
+ * inversion and swap, so "right" is where the cursor would have gone. */
+static void gesture_cursor_delta(const struct runtime_processor_data *data, bool is_x,
+                                 int32_t value, int32_t *dx, int32_t *dy) {
+    // Times the x1000 matrix stays well inside int32
+    int32_t v = CLAMP(value, INT16_MIN, INT16_MAX);
+    int32_t x;
+    int32_t y;
+    if (data->transform_identity) {
+        x = is_x ? v * RIP_GESTURE_MILLI : 0;
+        y = is_x ? 0 : v * RIP_GESTURE_MILLI;
+    } else {
+        x = (is_x ? data->transform.xx : data->transform.xy) * v;
+        y = (is_x ? data->transform.yx : data->transform.yy) * v;
+    }
+    if (data->x_invert) {
+        x = -x;
+    }
+    if (data->y_invert) {
+        y = -y;
+    }
+    if (data->xy_swap_enabled && !data->xy_to_scroll_enabled) {
+        int32_t t = x;
+        x = y;
+        y = t;
+    }
+    *dx = x;
+    *dy = y;
+}
+
+/* Whether gesture keys hold the ball at now: one is held, or the last one
+ * went up and the ball has not been still since. Call with gesture_lock held,
+ * before the event being handled is added. */
+static bool gesture_engaged(struct runtime_processor_data *data, uint32_t now) {
+    if (data->gesture_hold_count > 0) {
+        return true;
+    }
+    if (data->gesture_draining &&
+        !rip_gesture_draining(&data->gesture, data->gesture_up_ms, now)) {
+        data->gesture_draining = false;
+    }
+    return data->gesture_draining;
+}
+
+/* A motion event of gesture_dev, held or not, so the detector always knows
+ * whether the ball is still. Returns true while gesture keys hold the ball:
+ * the event then moves nothing. A flick hands its direction to the fire
+ * work. Runs on the input thread. */
+static bool gesture_handle_event(struct runtime_processor_data *data, struct input_event *event,
+                                 bool is_x) {
+    uint32_t now = (uint32_t)k_uptime_get();
+    int32_t dx;
+    int32_t dy;
+    gesture_cursor_delta(data, is_x, event->value, &dx, &dy);
+    const struct rip_gesture_params params = {
+        .distance = data->gesture_distance,
+        .still_ms = data->gesture_still_ms,
+        .window_ms = GESTURE_WINDOW_MS,
+    };
+
+    k_spinlock_key_t key = k_spin_lock(&data->gesture_lock);
+    bool engaged = gesture_engaged(data, now);
+    int dir = rip_gesture_event(&data->gesture, &params, data->gesture_hold_count > 0, dx, dy,
+                                now);
+    if (dir != RIP_GESTURE_NONE) {
+        data->gesture_pending_dir = (int8_t)dir;
+    }
+    k_spin_unlock(&data->gesture_lock, key);
+
+    if (dir != RIP_GESTURE_NONE) {
+        k_work_submit(&data->gesture_fire_work);
+    }
+    if (engaged) {
+        event->value = 0;
+    }
+    return engaged;
+}
+
+/* For processors other than gesture_dev: whether its gesture keys hold the
+ * ball, so the motion is left for gesture_dev. */
+static bool gesture_holds_ball(void) {
+    struct runtime_processor_data *owner = gesture_dev->data;
+    uint32_t now = (uint32_t)k_uptime_get();
+    k_spinlock_key_t key = k_spin_lock(&owner->gesture_lock);
+    bool engaged = gesture_engaged(owner, now);
+    k_spin_unlock(&owner->gesture_lock, key);
+    return engaged;
+}
+
+/* Motion another processor uses up (scroll on its layer) never reaches
+ * gesture_dev, which only needs to know that the ball moves. */
+static void gesture_note_motion(int32_t value) {
+    struct runtime_processor_data *owner = gesture_dev->data;
+    uint32_t now = (uint32_t)k_uptime_get();
+    uint32_t moved = input_value_magnitude((int16_t)CLAMP(value, INT16_MIN, INT16_MAX)) *
+                     RIP_GESTURE_MILLI;
+    k_spinlock_key_t key = k_spin_lock(&owner->gesture_lock);
+    rip_gesture_note_motion(&owner->gesture, moved, now);
+    k_spin_unlock(&owner->gesture_lock, key);
+}
+
+/* The shortcut a gesture is tapping goes up (system work queue). */
+static void gesture_release_tap(struct runtime_processor_data *data) {
+    if (data->gesture_tapped_keycode == 0) {
+        return;
+    }
+    raise_zmk_keycode_state_changed_from_encoded(data->gesture_tapped_keycode, false,
+                                                 k_uptime_get());
+    data->gesture_tapped_keycode = 0;
+}
+
+static void gesture_release_work_handler(struct k_work *work) {
+    struct k_work_delayable *dwork = k_work_delayable_from_work(work);
+    struct runtime_processor_data *data =
+        CONTAINER_OF(dwork, struct runtime_processor_data, gesture_release_work);
+    gesture_release_tap(data);
+}
+
+/* A flick fired: tap its shortcut (down, GESTURE_TAP_MS, up) on the system
+ * work queue like a key, never held, so the host does not repeat it. In test
+ * mode Studio is told instead and nothing is typed. */
+static void gesture_fire_work_handler(struct k_work *work) {
+    struct runtime_processor_data *data =
+        CONTAINER_OF(work, struct runtime_processor_data, gesture_fire_work);
+    int64_t now = k_uptime_get();
+
+    k_spinlock_key_t key = k_spin_lock(&data->gesture_lock);
+    int dir = data->gesture_pending_dir;
+    data->gesture_pending_dir = RIP_GESTURE_NONE;
+    uint32_t keycode = dir >= 0 && dir < RIP_GESTURE_DIRS ? data->gesture_keycodes[dir] : 0;
+    bool test = data->gesture_test_until > now;
+    k_spin_unlock(&data->gesture_lock, key);
+    if (dir < 0 || dir >= RIP_GESTURE_DIRS) {
+        return;
+    }
+
+    LOG_INF("Gesture %d fired: 0x%08x%s", dir, (unsigned int)keycode,
+            test ? " (test, not sent)" : "");
+    if (test) {
+        raise_zmk_input_processor_gesture_fired((struct zmk_input_processor_gesture_fired){
+            .dev = data->dev, .direction = (uint8_t)dir, .keycode = keycode});
+        return;
+    }
+    if (keycode == 0) {
+        return;
+    }
+    // One tap at a time: one still down goes up first
+    k_work_cancel_delayable(&data->gesture_release_work);
+    gesture_release_tap(data);
+    raise_zmk_keycode_state_changed_from_encoded(keycode, true, now);
+    data->gesture_tapped_keycode = keycode;
+    k_work_schedule(&data->gesture_release_work, K_MSEC(GESTURE_TAP_MS));
+}
+
 static int runtime_processor_handle_event(const struct device *dev, struct input_event *event,
                                           uint32_t param1, uint32_t param2,
                                           struct zmk_input_processor_state *state) {
@@ -1075,6 +1318,16 @@ static int runtime_processor_handle_event(const struct device *dev, struct input
         return ZMK_INPUT_PROC_CONTINUE;
     }
 
+    // Gestures before everything else, on every layer: while gesture keys
+    // hold the ball its motion moves nothing (see gesture_handle_event)
+    if (gesture_dev == dev) {
+        if (gesture_handle_event(data, event, x_idx >= 0)) {
+            return ZMK_INPUT_PROC_CONTINUE;
+        }
+    } else if (gesture_dev != NULL && gesture_holds_ball()) {
+        return ZMK_INPUT_PROC_CONTINUE;
+    }
+
     // Check if processor should be active for current layers
     if (!is_processor_active_for_current_layers(data->active_layers)) {
         if (data->inertia_active) {
@@ -1084,6 +1337,18 @@ static int runtime_processor_handle_event(const struct device *dev, struct input
             data->accel_state = (struct rip_accel_state){0};
         }
         return ZMK_INPUT_PROC_CONTINUE;
+    }
+
+    // Motion this processor uses for something else than gesture_dev's cursor
+    // (scroll on its layer) still tells gesture_dev that the ball moves
+    if (gesture_dev != NULL && gesture_dev != dev) {
+        gesture_note_motion(event->value);
+    }
+
+    // An aim hold that moves the ball is in use: the tap of its tap & hold
+    // key types nothing (see zmk_input_processor_runtime_take_ball_used)
+    if (data->aim_hold_count > 0 && event->value != 0) {
+        atomic_add(&data->aim_hold_motion, (atomic_val_t)input_value_magnitude(event->value));
     }
 
     // Drop input for a moment after a mouse button press or release, so a
@@ -1440,6 +1705,26 @@ struct rip_persist_v8 {
 
 #define RIP_SETTINGS_BLOB_SIZE (1 + sizeof(struct rip_persist_v8))
 
+/*
+ * Gesture settings live in a second entry per processor
+ * ("<processor-label>_gesture"), so the blob above keeps its v8 layout (and
+ * older firmware still reads it) and the gesture keycodes have room of their
+ * own. Same scheme: a version byte, then the packed struct.
+ */
+#define RIP_GESTURE_SETTINGS_KEY_SUFFIX "_gesture"
+#define RIP_GESTURE_SETTINGS_VERSION 1
+
+struct rip_gesture_persist_v1 {
+    uint32_t keycodes[RIP_GESTURE_DIRS]; // left, right, up, down; 0 = nothing
+    uint16_t distance;
+    uint16_t still_ms;
+} __packed;
+
+#define RIP_GESTURE_SETTINGS_SIZE (1 + sizeof(struct rip_gesture_persist_v1))
+
+BUILD_ASSERT(RIP_GESTURE_SETTINGS_SIZE <= CONFIG_ZMK_CUSTOM_SETTINGS_VALUE_MAX_SIZE,
+             "gesture settings blob exceeds CONFIG_ZMK_CUSTOM_SETTINGS_VALUE_MAX_SIZE");
+
 /* The entry below is a plain ZMK_CUSTOM_SETTING_DEFINE BYTES setting, whose
  * value holds at most CONFIG_ZMK_CUSTOM_SETTINGS_VALUE_MAX_SIZE bytes; the
  * reads and writes go through struct zmk_custom_setting_value, sized the same.
@@ -1505,6 +1790,49 @@ static size_t pack_processor_settings(const struct runtime_processor_data *data,
     buf[0] = RIP_SETTINGS_BLOB_VERSION;
     memcpy(&buf[1], &settings, sizeof(settings));
     return RIP_SETTINGS_BLOB_SIZE;
+}
+
+/* Writes [version][raw struct] of the gesture baseline into buf (must be >=
+ * RIP_GESTURE_SETTINGS_SIZE) and returns the number of bytes written. */
+static size_t pack_gesture_settings(const struct runtime_processor_data *data, uint8_t *buf) {
+    struct rip_gesture_persist_v1 settings = {
+        .distance = data->persistent_gesture_distance,
+        .still_ms = data->persistent_gesture_still_ms,
+    };
+    memcpy(settings.keycodes, data->persistent_gesture_keycodes, sizeof(settings.keycodes));
+    buf[0] = RIP_GESTURE_SETTINGS_VERSION;
+    memcpy(&buf[1], &settings, sizeof(settings));
+    return RIP_GESTURE_SETTINGS_SIZE;
+}
+
+/* Apply a saved gesture entry to the live values and the baseline. */
+static int unpack_and_apply_gesture_settings(struct runtime_processor_data *data,
+                                             const uint8_t *buf, size_t len) {
+    if (len != RIP_GESTURE_SETTINGS_SIZE || buf[0] != RIP_GESTURE_SETTINGS_VERSION) {
+        return -EINVAL;
+    }
+    struct rip_gesture_persist_v1 saved;
+    memcpy(&saved, &buf[1], sizeof(saved));
+    for (int i = 0; i < RIP_GESTURE_DIRS; i++) {
+        if (!gesture_keycode_valid(saved.keycodes[i])) {
+            return -EINVAL;
+        }
+    }
+    if (saved.distance != rip_gesture_clamp_distance(saved.distance) ||
+        saved.still_ms != rip_gesture_clamp_still_ms(saved.still_ms)) {
+        return -EINVAL;
+    }
+
+    k_spinlock_key_t key = k_spin_lock(&data->gesture_lock);
+    memcpy(data->gesture_keycodes, saved.keycodes, sizeof(data->gesture_keycodes));
+    data->gesture_distance = saved.distance;
+    data->gesture_still_ms = saved.still_ms;
+    k_spin_unlock(&data->gesture_lock, key);
+    memcpy(data->persistent_gesture_keycodes, saved.keycodes,
+           sizeof(data->persistent_gesture_keycodes));
+    data->persistent_gesture_distance = saved.distance;
+    data->persistent_gesture_still_ms = saved.still_ms;
+    return 0;
 }
 
 /* v1 has no inertia fields; start from the current devicetree defaults.
@@ -1807,7 +2135,8 @@ int zmk_input_processor_runtime_test_apply_legacy_v5(const struct device *dev) {
 }
 #endif
 
-/* Pack the processor's current baseline and flush it to flash immediately. */
+/* Pack the processor's current baseline (both entries) and flush it to flash
+ * immediately. */
 static int save_processor_settings_now(const struct device *dev) {
     struct runtime_processor_data *data = dev->data;
     const struct runtime_processor_config *cfg = dev->config;
@@ -1822,7 +2151,16 @@ static int save_processor_settings_now(const struct device *dev) {
     } else {
         LOG_INF("Saved settings for %s", cfg->name);
     }
-    return ret;
+
+    struct zmk_custom_setting_value gesture = {.type = ZMK_CUSTOM_SETTING_VALUE_TYPE_BYTES};
+    gesture.size = pack_gesture_settings(data, gesture.bytes_value);
+    int gesture_ret = zmk_custom_setting_write_by_key(
+        RIP_SETTINGS_SUBSYSTEM_ID, cfg->gesture_settings_key, &gesture,
+        ZMK_CUSTOM_SETTING_WRITE_MODE_PERSIST);
+    if (gesture_ret < 0) {
+        LOG_ERR("Failed to save gesture settings for %s: %d", cfg->name, gesture_ret);
+    }
+    return ret < 0 ? ret : gesture_ret;
 }
 
 static void save_processor_settings_work_handler(struct k_work *work) {
@@ -1848,6 +2186,28 @@ void zmk_input_processor_runtime_test_flush_save(const struct device *dev) {
 #endif
 
 #endif // CONFIG_ZMK_CUSTOM_SETTINGS
+
+/* Gesture settings (live value and baseline) from the devicetree. */
+static void load_gesture_defaults(struct runtime_processor_data *data) {
+    const struct runtime_processor_config *cfg = data->dev->config;
+    uint32_t keycodes[RIP_GESTURE_DIRS];
+    for (int i = 0; i < RIP_GESTURE_DIRS; i++) {
+        keycodes[i] = gesture_keycode_valid(cfg->initial_gesture_keycodes[i])
+                          ? cfg->initial_gesture_keycodes[i]
+                          : 0;
+    }
+    uint16_t distance = rip_gesture_clamp_distance(cfg->initial_gesture_distance);
+    uint16_t still_ms = rip_gesture_clamp_still_ms(cfg->initial_gesture_still_ms);
+
+    k_spinlock_key_t key = k_spin_lock(&data->gesture_lock);
+    memcpy(data->gesture_keycodes, keycodes, sizeof(data->gesture_keycodes));
+    data->gesture_distance = distance;
+    data->gesture_still_ms = still_ms;
+    k_spin_unlock(&data->gesture_lock, key);
+    memcpy(data->persistent_gesture_keycodes, keycodes, sizeof(data->persistent_gesture_keycodes));
+    data->persistent_gesture_distance = distance;
+    data->persistent_gesture_still_ms = still_ms;
+}
 
 static int runtime_processor_init(const struct device *dev) {
     const struct runtime_processor_config *cfg = dev->config;
@@ -1961,6 +2321,19 @@ static int runtime_processor_init(const struct device *dev) {
     data->aim_axis[1] = (struct rip_aim_axis){0};
     data->click_freeze_until = 0;
     k_work_init_delayable(&data->aim_work, aim_work_handler);
+    atomic_set(&data->aim_hold_motion, 0);
+
+    // Gestures start with the devicetree settings, no key held
+    load_gesture_defaults(data);
+    data->gesture_hold_count = 0;
+    data->gesture = (struct rip_gesture){.last_dir = RIP_GESTURE_NONE};
+    data->gesture_draining = false;
+    data->gesture_pending_dir = RIP_GESTURE_NONE;
+    data->gesture_test_until = 0;
+    data->gesture_tapped_keycode = 0;
+    data->ball_used_at = 0;
+    k_work_init(&data->gesture_fire_work, gesture_fire_work_handler);
+    k_work_init_delayable(&data->gesture_release_work, gesture_release_work_handler);
 
     LOG_INF("Runtime processor '%s' initialized", cfg->name);
 
@@ -2120,6 +2493,8 @@ static void load_processor_defaults(const struct device *dev) {
     data->persistent_inertia_fast_threshold = data->inertia_fast_threshold;
     data->persistent_inertia_fast_output_percent = data->inertia_fast_output_percent;
     inertia_stop(data, ZMK_INPUT_PROCESSOR_INERTIA_STOP_REASON_SETTINGS_CHANGED);
+
+    load_gesture_defaults(data);
 
     update_rotation_values(data);
 }
@@ -2342,6 +2717,14 @@ void zmk_input_processor_runtime_restore_persistent(const struct device *dev) {
     data->inertia_fast_output_percent = data->persistent_inertia_fast_output_percent;
     inertia_stop(data, ZMK_INPUT_PROCESSOR_INERTIA_STOP_REASON_SETTINGS_CHANGED);
 
+    // Restore gesture settings
+    k_spinlock_key_t key = k_spin_lock(&data->gesture_lock);
+    memcpy(data->gesture_keycodes, data->persistent_gesture_keycodes,
+           sizeof(data->gesture_keycodes));
+    data->gesture_distance = data->persistent_gesture_distance;
+    data->gesture_still_ms = data->persistent_gesture_still_ms;
+    k_spin_unlock(&data->gesture_lock, key);
+
     LOG_DBG("Restored persistent values");
 }
 
@@ -2391,6 +2774,10 @@ int zmk_input_processor_runtime_get_config(const struct device *dev, const char 
         config->inertia_fast_output_percent = data->persistent_inertia_fast_output_percent;
         config->inertia_notifications_enabled = data->inertia_notifications_enabled;
         config->inertia_active = data->inertia_active;
+        memcpy(config->gesture_keycodes, data->persistent_gesture_keycodes,
+               sizeof(config->gesture_keycodes));
+        config->gesture_distance = data->persistent_gesture_distance;
+        config->gesture_still_ms = data->persistent_gesture_still_ms;
     }
 
     return 0;
@@ -2434,6 +2821,15 @@ int zmk_input_processor_runtime_get_config(const struct device *dev, const char 
         .initial_aim_smoothing_ms = (int32_t)DT_INST_PROP_OR(n, aim_smoothing_ms, 50),             \
         .initial_smoothing_ms = (int32_t)DT_INST_PROP_OR(n, smoothing_ms, 0),                      \
         .click_freeze_ms = DT_INST_PROP_OR(n, click_freeze_ms, 0),                                 \
+        .initial_gesture_keycodes = {(uint32_t)DT_INST_PROP_OR(n, gesture_left, 0),                \
+                                     (uint32_t)DT_INST_PROP_OR(n, gesture_right, 0),               \
+                                     (uint32_t)DT_INST_PROP_OR(n, gesture_up, 0),                  \
+                                     (uint32_t)DT_INST_PROP_OR(n, gesture_down, 0)},               \
+        .initial_gesture_distance = (int32_t)DT_INST_PROP_OR(n, gesture_distance, 330),            \
+        .initial_gesture_still_ms = (int32_t)DT_INST_PROP_OR(n, gesture_still_ms, 150),            \
+        IF_ENABLED(CONFIG_ZMK_CUSTOM_SETTINGS,                                                     \
+                   (.gesture_settings_key =                                                        \
+                        DT_INST_PROP(n, processor_label) RIP_GESTURE_SETTINGS_KEY_SUFFIX, ))       \
         .temp_layer_transparent_behavior = COND_CODE_1(                                            \
             DT_INST_NODE_HAS_PROP(n, temp_layer_transparent_behavior),                             \
             (DEVICE_DT_GET(DT_INST_PHANDLE(n, temp_layer_transparent_behavior))), (NULL)),         \
@@ -2495,6 +2891,17 @@ DT_INST_FOREACH_STATUS_OKAY(RUNTIME_PROCESSOR_INST)
         ZMK_CUSTOM_SETTING_NO_CONSTRAINT);
 
 DT_INST_FOREACH_STATUS_OKAY(RUNTIME_PROCESSOR_SETTINGS_INST)
+
+/* The gesture entry of each instance (see RIP_GESTURE_SETTINGS_KEY_SUFFIX). */
+#define RUNTIME_PROCESSOR_GESTURE_SETTINGS_INST(n)                                                 \
+    ZMK_CUSTOM_SETTING_DEFINE(                                                                     \
+        runtime_processor_gesture_setting_##n, RIP_SETTINGS_SUBSYSTEM_ID,                          \
+        DT_INST_PROP(n, processor_label) RIP_GESTURE_SETTINGS_KEY_SUFFIX,                          \
+        ZMK_CUSTOM_SETTING_VALUE_TYPE_BYTES, RIP_SETTINGS_EMPTY_BYTES_DEFAULT,                     \
+        ZMK_CUSTOM_SETTING_CONFIDENTIALITY_RPC_PUBLIC, ZMK_CUSTOM_SETTING_PERMISSION_UNSECURE,     \
+        ZMK_CUSTOM_SETTING_PERMISSION_UNSECURE, ZMK_CUSTOM_SETTING_NO_CONSTRAINT);
+
+DT_INST_FOREACH_STATUS_OKAY(RUNTIME_PROCESSOR_GESTURE_SETTINGS_INST)
 #endif
 
 #if DT_HAS_COMPAT_STATUS_OKAY(DT_DRV_COMPAT)
@@ -2567,11 +2974,41 @@ int zmk_input_processor_runtime_get_id(const struct device *dev) {
  * clobbering behavior-set temporary values and a write->changed->apply
  * write recursion.
  */
+/* Apply the saved gesture entry, if any (devicetree defaults stay otherwise).
+ * Returns true when one was applied. */
+static bool apply_persisted_gesture_settings(const struct device *dev) {
+    const struct runtime_processor_config *cfg = dev->config;
+    struct runtime_processor_data *data = dev->data;
+
+    struct zmk_custom_setting_value value;
+    if (zmk_custom_setting_read_by_key(RIP_SETTINGS_SUBSYSTEM_ID, cfg->gesture_settings_key,
+                                       &value) < 0 ||
+        value.type != ZMK_CUSTOM_SETTING_VALUE_TYPE_BYTES || value.size == 0) {
+        return false;
+    }
+    if (unpack_and_apply_gesture_settings(data, value.bytes_value, value.size) < 0) {
+        LOG_WRN("Ignoring invalid persisted gesture settings for %s (size=%u)", cfg->name,
+                (unsigned int)value.size);
+        return false;
+    }
+    LOG_INF("Loaded gesture settings for %s: 0x%08x 0x%08x 0x%08x 0x%08x, %u counts, %u ms",
+            cfg->name, (unsigned int)data->persistent_gesture_keycodes[0],
+            (unsigned int)data->persistent_gesture_keycodes[1],
+            (unsigned int)data->persistent_gesture_keycodes[2],
+            (unsigned int)data->persistent_gesture_keycodes[3],
+            (unsigned int)data->persistent_gesture_distance,
+            (unsigned int)data->persistent_gesture_still_ms);
+    return true;
+}
+
 static int apply_persisted_settings_cb(const struct device *dev, void *user_data) {
     ARG_UNUSED(user_data);
 
     const struct runtime_processor_config *cfg = dev->config;
     struct runtime_processor_data *data = dev->data;
+
+    // Its own entry: applied even when the main one is missing or invalid
+    apply_persisted_gesture_settings(dev);
 
     struct zmk_custom_setting_value value;
     int ret = zmk_custom_setting_read_by_key(RIP_SETTINGS_SUBSYSTEM_ID, cfg->name, &value);
@@ -2643,6 +3080,10 @@ static int discard_processor_settings_cb(const struct device *dev, void *user_da
     } else {
         load_processor_defaults(dev);
         LOG_INF("Discarded unsaved changes for %s (no saved value, using defaults)", cfg->name);
+    }
+    // The gesture entry on its own: the saved one, else the defaults
+    if (!apply_persisted_gesture_settings(dev)) {
+        load_gesture_defaults(data);
     }
     raise_state_changed_event(dev);
     return 0;
@@ -3469,16 +3910,26 @@ void zmk_input_processor_runtime_aim(const struct device *dev, bool hold) {
 
     LOG_DBG("Aim %s, held by %u", hold ? "pressed" : "released", count);
 
+    // Whether this hold moved the ball, for the tap of its tap & hold key
+    if (hold) {
+        atomic_set(&data->aim_hold_motion, 0);
+    } else {
+        bool used = atomic_get(&data->aim_hold_motion) >=
+                    (atomic_val_t)(RIP_GESTURE_USED_MILLI / RIP_GESTURE_MILLI);
+        data->ball_used_at = used ? k_uptime_get() : 0;
+    }
+
     // A glide that is still running would carry the cursor past the target
     if (hold && data->inertia_active) {
         inertia_stop(data, ZMK_INPUT_PROCESSOR_INERTIA_STOP_REASON_UNSPECIFIED);
     }
 
     // Aiming often pauses longer than the temp-layer timeout: keep the layer
-    // (and the clicks on it) while held, and time out as usual after release.
+    // (and the clicks on it) while held, and time out as usual after release
+    // (unless a gesture key still holds it).
     if (data->temp_layer_enabled && data->temp_layer_layer_active &&
         !data->temp_layer_keep_active) {
-        if (count > 0) {
+        if (count > 0 || data->gesture_hold_count > 0) {
             k_work_cancel_delayable(&data->temp_layer_deactivation_work);
         } else {
             k_work_reschedule(&data->temp_layer_deactivation_work,
@@ -3490,6 +3941,140 @@ void zmk_input_processor_runtime_aim(const struct device *dev, bool hold) {
     if (count == 0 && busy) {
         k_work_schedule(&data->aim_work, K_MSEC(AIM_INTERVAL_MS));
     }
+}
+
+void zmk_input_processor_runtime_gesture_attach(const struct device *dev) {
+    if (!dev) {
+        return;
+    }
+    if (gesture_dev == NULL) {
+        gesture_dev = dev;
+    } else if (gesture_dev != dev) {
+        LOG_WRN("Gestures already act on another processor, ignoring a second one");
+    }
+}
+
+void zmk_input_processor_runtime_gesture(const struct device *dev, bool hold) {
+    if (!dev) {
+        return;
+    }
+
+    struct runtime_processor_data *data = dev->data;
+    int64_t now = k_uptime_get();
+
+    k_spinlock_key_t key = k_spin_lock(&data->gesture_lock);
+    if (hold) {
+        if (data->gesture_hold_count == 0) {
+            rip_gesture_begin(&data->gesture);
+            data->gesture_draining = false;
+        }
+        if (data->gesture_hold_count < UINT8_MAX) {
+            data->gesture_hold_count++;
+        }
+    } else if (data->gesture_hold_count > 0) {
+        data->gesture_hold_count--;
+        if (data->gesture_hold_count == 0) {
+            // The cursor stays put until the ball stops; whether the hold
+            // used the ball decides the tap of its tap & hold key
+            bool used = rip_gesture_end(&data->gesture);
+            data->ball_used_at = used ? now : 0;
+            data->gesture_up_ms = (uint32_t)now;
+            data->gesture_draining = true;
+        }
+    }
+    uint8_t count = data->gesture_hold_count;
+    k_spin_unlock(&data->gesture_lock, key);
+
+    LOG_DBG("Gesture %s, held by %u", hold ? "pressed" : "released", count);
+
+    if (hold && count == 1) {
+        // The cursor stops where it is: what smoothing still holds back is
+        // dropped and a glide ends
+        key = k_spin_lock(&data->aim_lock);
+        bool had_aim = aim_busy(data);
+        data->aim_axis[0] = (struct rip_aim_axis){0};
+        data->aim_axis[1] = (struct rip_aim_axis){0};
+        k_spin_unlock(&data->aim_lock, key);
+        if (had_aim) {
+            k_work_cancel_delayable(&data->aim_work);
+        }
+        if (data->inertia_active) {
+            inertia_stop(data, ZMK_INPUT_PROCESSOR_INERTIA_STOP_REASON_UNSPECIFIED);
+        }
+    }
+
+    // Like aim: the temp layer (where the key may be) stays while held and
+    // times out as usual after the release
+    if (data->temp_layer_enabled && data->temp_layer_layer_active &&
+        !data->temp_layer_keep_active) {
+        if (count > 0 || data->aim_hold_count > 0) {
+            k_work_cancel_delayable(&data->temp_layer_deactivation_work);
+        } else {
+            k_work_reschedule(&data->temp_layer_deactivation_work,
+                              K_MSEC(data->temp_layer_deactivation_delay_ms));
+        }
+    }
+}
+
+int zmk_input_processor_runtime_set_gesture(
+    const struct device *dev, const uint32_t keycodes[ZMK_INPUT_PROCESSOR_GESTURE_DIRS],
+    uint32_t distance, uint32_t still_ms, enum zmk_input_processor_runtime_write_mode mode) {
+    if (!dev || !keycodes) {
+        return -EINVAL;
+    }
+    for (int i = 0; i < RIP_GESTURE_DIRS; i++) {
+        if (!gesture_keycode_valid(keycodes[i])) {
+            LOG_WRN("Gesture %d keycode 0x%08x is not a key", i, (unsigned int)keycodes[i]);
+            return -EINVAL;
+        }
+    }
+
+    struct runtime_processor_data *data = dev->data;
+    uint16_t d = rip_gesture_clamp_distance(distance);
+    uint16_t s = rip_gesture_clamp_still_ms(still_ms);
+
+    k_spinlock_key_t key = k_spin_lock(&data->gesture_lock);
+    memcpy(data->gesture_keycodes, keycodes, sizeof(data->gesture_keycodes));
+    data->gesture_distance = d;
+    data->gesture_still_ms = s;
+    k_spin_unlock(&data->gesture_lock, key);
+    if (mode != ZMK_INPUT_PROCESSOR_RUNTIME_WRITE_MODE_TEMPORARY) {
+        memcpy(data->persistent_gesture_keycodes, keycodes,
+               sizeof(data->persistent_gesture_keycodes));
+        data->persistent_gesture_distance = d;
+        data->persistent_gesture_still_ms = s;
+    }
+
+    LOG_INF("Set gestures to 0x%08x 0x%08x 0x%08x 0x%08x, %u counts, %u ms%s",
+            (unsigned int)keycodes[0], (unsigned int)keycodes[1], (unsigned int)keycodes[2],
+            (unsigned int)keycodes[3], (unsigned int)d, (unsigned int)s, write_mode_label(mode));
+
+    return commit_write(dev, mode);
+}
+
+int zmk_input_processor_runtime_set_gesture_test(const struct device *dev, bool enabled) {
+    if (!dev) {
+        return -EINVAL;
+    }
+
+    struct runtime_processor_data *data = dev->data;
+    k_spinlock_key_t key = k_spin_lock(&data->gesture_lock);
+    data->gesture_test_until = enabled ? k_uptime_get() + GESTURE_TEST_MS : 0;
+    k_spin_unlock(&data->gesture_lock, key);
+
+    LOG_INF("Gesture test %s", enabled ? "on" : "off");
+    return 0;
+}
+
+bool zmk_input_processor_runtime_take_ball_used(const struct device *dev) {
+    if (!dev) {
+        return false;
+    }
+
+    struct runtime_processor_data *data = dev->data;
+    int64_t at = data->ball_used_at;
+    data->ball_used_at = 0;
+    return at != 0 && k_uptime_get() - at <= BALL_USED_TAP_MS;
 }
 
 int zmk_input_processor_runtime_set_xy_to_scroll_enabled(

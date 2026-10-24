@@ -32,6 +32,19 @@ enum zmk_input_processor_runtime_write_mode {
 };
 
 /**
+ * @brief Gesture directions, in the cursor frame; also the order of the
+ * gesture keycodes
+ */
+enum zmk_input_processor_gesture_direction {
+    ZMK_INPUT_PROCESSOR_GESTURE_LEFT = 0,
+    ZMK_INPUT_PROCESSOR_GESTURE_RIGHT = 1,
+    ZMK_INPUT_PROCESSOR_GESTURE_UP = 2,
+    ZMK_INPUT_PROCESSOR_GESTURE_DOWN = 3,
+};
+
+#define ZMK_INPUT_PROCESSOR_GESTURE_DIRS 4
+
+/**
  * @brief Runtime input processor configuration
  */
 struct zmk_input_processor_runtime_config {
@@ -80,6 +93,13 @@ struct zmk_input_processor_runtime_config {
     uint16_t inertia_fast_output_percent;
     bool inertia_notifications_enabled;
     bool inertia_active;
+    // Gestures: what a flick fires while a gesture key is held (ZMK encoded
+    // keycodes as &kp's parameter, 0 = nothing; left, right, up, down), the
+    // sensor counts a flick covers and how long the ball must be still
+    // before the next one (see zmk_input_processor_runtime_set_gesture)
+    uint32_t gesture_keycodes[ZMK_INPUT_PROCESSOR_GESTURE_DIRS];
+    uint16_t gesture_distance;
+    uint16_t gesture_still_ms;
 };
 
 /**
@@ -406,6 +426,76 @@ void zmk_input_processor_runtime_aim(const struct device *dev, bool hold);
  * @param percent 0 = use the aim scale; anything else is clamped to 10..100
  */
 void zmk_input_processor_runtime_set_aim_key_scale(const struct device *dev, uint32_t percent);
+
+/**
+ * @brief Let gesture behaviors act on this processor
+ *
+ * Called once at boot by a gesture behavior for the processor it names. Its
+ * motion events then feed the gesture detector, and while gesture keys hold
+ * the ball every other processor leaves the motion to it. Only one processor
+ * can take gestures; the first wins.
+ *
+ * @param dev Pointer to the device structure
+ */
+void zmk_input_processor_runtime_gesture_attach(const struct device *dev);
+
+/**
+ * @brief Hold or release gesture mode (called by the gesture behavior)
+ *
+ * While held by at least one key, the processor's motion moves nothing and a
+ * flick (the gesture distance within a short window, see set_gesture) taps
+ * the keycode assigned to its direction once. Nothing more fires until the
+ * ball stops (or turns back for the next flick); after the last release the
+ * cursor stays put until the ball stops. The temp-layer layer stays active
+ * while held. Each hold must be matched by one release.
+ *
+ * @param dev Pointer to the device structure
+ * @param hold true on key press, false on key release
+ */
+void zmk_input_processor_runtime_gesture(const struct device *dev, bool hold);
+
+/**
+ * @brief Set what gestures fire and how far a flick must go
+ *
+ * @param dev Pointer to the device structure
+ * @param keycodes ZMK encoded keycodes (as &kp's parameter, implicit modifiers
+ *        allowed; 0 = nothing) for left, right, up and down. A keycode that is
+ *        not a keyboard or consumer usage is rejected with -EINVAL
+ * @param distance Sensor counts a flick covers within the window; clamped to
+ *        40..2400
+ * @param still_ms How long the ball must be still before the next flick;
+ *        clamped to 50..1000
+ * @param mode Where to store the values (persist to flash, memory-only, or temporary)
+ * @return 0 on success, negative error code on failure
+ */
+int zmk_input_processor_runtime_set_gesture(
+    const struct device *dev, const uint32_t keycodes[ZMK_INPUT_PROCESSOR_GESTURE_DIRS],
+    uint32_t distance, uint32_t still_ms, enum zmk_input_processor_runtime_write_mode mode);
+
+/**
+ * @brief Turn gesture test mode on or off (RAM only)
+ *
+ * In test mode a flick raises zmk_input_processor_gesture_fired (Studio shows
+ * it) instead of tapping its keycode. It ends by itself about a minute after
+ * the last request, so a client that goes away does not leave gestures off.
+ *
+ * @param dev Pointer to the device structure
+ * @param enabled true to start (or extend) test mode, false to end it
+ * @return 0 on success, negative error code on failure
+ */
+int zmk_input_processor_runtime_set_gesture_test(const struct device *dev, bool enabled);
+
+/**
+ * @brief Whether the aim or gesture hold that just ended used the ball
+ *
+ * For the tap side of a tap & hold key whose hold is aim or a gesture: true
+ * when such a hold on this processor ended a moment ago after moving the ball
+ * (or firing a gesture), so the tap is not typed. Clears the record.
+ *
+ * @param dev Pointer to the device structure
+ * @return true to drop the tap
+ */
+bool zmk_input_processor_runtime_take_ball_used(const struct device *dev);
 
 /**
  * @brief Set axis snap mode

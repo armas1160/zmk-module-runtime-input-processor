@@ -70,6 +70,10 @@ static int handle_set_accel(const cormoran_rip_SetAccelRequest *req, cormoran_ri
 static int handle_set_aim(const cormoran_rip_SetAimRequest *req, cormoran_rip_Response *resp);
 static int handle_set_smoothing(const cormoran_rip_SetSmoothingRequest *req,
                                 cormoran_rip_Response *resp);
+static int handle_set_gesture(const cormoran_rip_SetGestureRequest *req,
+                              cormoran_rip_Response *resp);
+static int handle_set_gesture_test(const cormoran_rip_SetGestureTestRequest *req,
+                                   cormoran_rip_Response *resp);
 static int handle_reset_input_processor(const cormoran_rip_ResetInputProcessorRequest *req,
                                         cormoran_rip_Response *resp);
 static int handle_set_temp_layer_enabled(const cormoran_rip_SetTempLayerEnabledRequest *req,
@@ -191,6 +195,12 @@ static bool rip_rpc_handle_request(const zmk_custom_CallRequest *raw_request,
         break;
     case cormoran_rip_Request_set_smoothing_tag:
         rc = handle_set_smoothing(&req.request_type.set_smoothing, resp);
+        break;
+    case cormoran_rip_Request_set_gesture_tag:
+        rc = handle_set_gesture(&req.request_type.set_gesture, resp);
+        break;
+    case cormoran_rip_Request_set_gesture_test_tag:
+        rc = handle_set_gesture_test(&req.request_type.set_gesture_test, resp);
         break;
     case cormoran_rip_Request_reset_input_processor_tag:
         rc = handle_reset_input_processor(&req.request_type.reset_input_processor, resp);
@@ -416,6 +426,13 @@ static int handle_get_input_processor(const cormoran_rip_GetInputProcessorReques
     result.processor.inertia_fast_output_percent = config.inertia_fast_output_percent;
     result.processor.inertia_notifications_enabled = config.inertia_notifications_enabled;
     result.processor.inertia_active = config.inertia_active;
+    result.processor.gesture_supported = true;
+    result.processor.gesture_left = config.gesture_keycodes[ZMK_INPUT_PROCESSOR_GESTURE_LEFT];
+    result.processor.gesture_right = config.gesture_keycodes[ZMK_INPUT_PROCESSOR_GESTURE_RIGHT];
+    result.processor.gesture_up = config.gesture_keycodes[ZMK_INPUT_PROCESSOR_GESTURE_UP];
+    result.processor.gesture_down = config.gesture_keycodes[ZMK_INPUT_PROCESSOR_GESTURE_DOWN];
+    result.processor.gesture_distance = config.gesture_distance;
+    result.processor.gesture_still_ms = config.gesture_still_ms;
 
     resp->which_response_type = cormoran_rip_Response_get_input_processor_tag;
     resp->response_type.get_input_processor = result;
@@ -663,6 +680,62 @@ static int handle_set_smoothing(const cormoran_rip_SetSmoothingRequest *req,
     resp->response_type.set_smoothing =
         (cormoran_rip_SetSmoothingResponse)cormoran_rip_SetSmoothingResponse_init_zero;
 
+    return 0;
+}
+
+/**
+ * Handle setting gestures (all four keycodes, distance and still time at once)
+ */
+static int handle_set_gesture(const cormoran_rip_SetGestureRequest *req,
+                              cormoran_rip_Response *resp) {
+    LOG_DBG("Setting gestures for id=%d", req->id);
+
+    const struct device *dev = zmk_input_processor_runtime_find_by_id(req->id);
+    if (!dev) {
+        LOG_WRN("Input processor not found: id=%d", req->id);
+        return -ENODEV;
+    }
+
+    const uint32_t keycodes[ZMK_INPUT_PROCESSOR_GESTURE_DIRS] = {
+        [ZMK_INPUT_PROCESSOR_GESTURE_LEFT] = req->left,
+        [ZMK_INPUT_PROCESSOR_GESTURE_RIGHT] = req->right,
+        [ZMK_INPUT_PROCESSOR_GESTURE_UP] = req->up,
+        [ZMK_INPUT_PROCESSOR_GESTURE_DOWN] = req->down,
+    };
+    int ret = zmk_input_processor_runtime_set_gesture(dev, keycodes, req->distance, req->still_ms,
+                                                      rip_write_mode(req->write_mode));
+    if (ret < 0) {
+        LOG_ERR("Failed to set gestures: %d", ret);
+        return ret;
+    }
+
+    // Return empty response
+    resp->which_response_type = cormoran_rip_Response_set_gesture_tag;
+    resp->response_type.set_gesture =
+        (cormoran_rip_SetGestureResponse)cormoran_rip_SetGestureResponse_init_zero;
+
+    return 0;
+}
+
+/**
+ * Handle turning gesture test mode on (or renewing it) and off
+ */
+static int handle_set_gesture_test(const cormoran_rip_SetGestureTestRequest *req,
+                                   cormoran_rip_Response *resp) {
+    const struct device *dev = zmk_input_processor_runtime_find_by_id(req->id);
+    if (!dev) {
+        LOG_WRN("Input processor not found: id=%d", req->id);
+        return -ENODEV;
+    }
+
+    int ret = zmk_input_processor_runtime_set_gesture_test(dev, req->enabled);
+    if (ret < 0) {
+        return ret;
+    }
+
+    resp->which_response_type = cormoran_rip_Response_set_gesture_test_tag;
+    resp->response_type.set_gesture_test =
+        (cormoran_rip_SetGestureTestResponse)cormoran_rip_SetGestureTestResponse_init_zero;
     return 0;
 }
 

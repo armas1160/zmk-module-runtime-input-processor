@@ -71,6 +71,14 @@ message InputProcessorInfo {
     // Auto-mouse activation distance: movement needed before the temp layer activates
     uint32 temp_layer_activation_distance = 40; // 0..100, accumulated |dx|+|dy| in output counts (≈ cursor px) within one motion burst; 0 = activate on any movement
     bool activation_distance_supported = 41;    // always true in this fork, so clients can detect support
+    // Gestures: while a gesture key is held, a flick taps the keycode of its direction
+    bool gesture_supported = 42;     // always true in this fork, so clients can detect support
+    uint32 gesture_left = 43;        // ZMK encoded keycode as &kp's parameter (implicit mods in the top byte); 0 = nothing
+    uint32 gesture_right = 44;
+    uint32 gesture_up = 45;
+    uint32 gesture_down = 46;
+    uint32 gesture_distance = 47;    // 40..2400 sensor counts a flick covers within the gesture window
+    uint32 gesture_still_ms = 48;    // 50..1000, how long the ball must be still before the next flick
 }
 
 message ListInputProcessorsRequest {
@@ -381,6 +389,29 @@ message SetTempLayerActivationDistanceRequest {
 }
 message SetTempLayerActivationDistanceResponse {}
 
+// Gestures, all at once so concurrent edits never mix. A keycode that is not a
+// keyboard or consumer usage is rejected; distance and still_ms are clamped.
+message SetGestureRequest {
+    uint32 id = 1;
+    uint32 left = 2;          // keycodes as &kp's parameter; 0 = nothing
+    uint32 right = 3;
+    uint32 up = 4;
+    uint32 down = 5;
+    uint32 distance = 6;      // 40..2400 sensor counts (clamped)
+    uint32 still_ms = 7;      // 50..1000 (clamped)
+    WriteMode write_mode = 8; // Where to store the values (default: persist)
+}
+message SetGestureResponse {}
+
+// Gesture test mode (RAM only): flicks send GestureFiredNotification instead of
+// their keycodes. It ends by itself about a minute after the last request with
+// enabled = true, so clients renew it while they show the test.
+message SetGestureTestRequest {
+    uint32 id = 1;
+    bool enabled = 2;
+}
+message SetGestureTestResponse {}
+
 // Persist every processor's current in-memory settings to flash. Flushes values
 // that were set with WRITE_MODE_MEMORY.
 message SaveAllSettingsRequest {
@@ -451,6 +482,8 @@ message Request {
         SetAimRequest set_aim = 37;
         SetSmoothingRequest set_smoothing = 38;
         SetTempLayerActivationDistanceRequest set_temp_layer_activation_distance = 39;
+        SetGestureRequest set_gesture = 40;
+        SetGestureTestRequest set_gesture_test = 41;
     }
 }
 
@@ -497,6 +530,8 @@ message Response {
         SetAimResponse set_aim = 38;
         SetSmoothingResponse set_smoothing = 39;
         SetTempLayerActivationDistanceResponse set_temp_layer_activation_distance = 40;
+        SetGestureResponse set_gesture = 41;
+        SetGestureTestResponse set_gesture_test = 42;
     }
 }
 
@@ -519,11 +554,18 @@ message InertiaFastInputChangedNotification {
     uint32 id = 1;
     bool fast_input = 2;
 }
+// A flick fired a gesture in test mode (nothing was typed)
+message GestureFiredNotification {
+    uint32 id = 1;
+    uint32 direction = 2; // 0 = left, 1 = right, 2 = up, 3 = down
+    uint32 keycode = 3;   // what it is assigned; 0 = nothing
+}
 
 message Notification {
     oneof notification_type {
         InputProcessorChangedNotification input_processor_changed = 1;
         InertiaStateChangedNotification inertia_state_changed = 2;
         InertiaFastInputChangedNotification inertia_fast_input_changed = 3;
+        GestureFiredNotification gesture_fired = 4;
     }
 }

@@ -84,6 +84,30 @@
 			#binding-cells = <1>;
 		};
 
+		// Gestures: while held, a flick fires the keycode the processor
+		// assigns to its direction (gesture-left etc.), once per flick
+        #if ZMK_BEHAVIOR_OMIT(RIP)
+		/omit-if-no-ref/
+		#endif
+		rip_gesture: gesture {
+			compatible = "zmk,behavior-input-processor-gesture";
+			display-name = "Gesture";
+			processor-name = "mouse";
+			#binding-cells = <0>;
+		};
+
+		// Tap side of a hold-tap whose hold is &rip_aim or &rip_gesture:
+		// like &kp, but not typed when the hold used the ball
+        #if ZMK_BEHAVIOR_OMIT(RIP)
+		/omit-if-no-ref/
+		#endif
+		rip_tap_key: tap_key {
+			compatible = "zmk,behavior-input-processor-tap-key";
+			display-name = "Ball Tap";
+			processor-name = "mouse";
+			#binding-cells = <1>;
+		};
+
         #if ZMK_BEHAVIOR_OMIT(RIP)
 		/omit-if-no-ref/
 		#endif
